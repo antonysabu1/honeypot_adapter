@@ -6,11 +6,11 @@ class FakeFilesystem:
                 "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
                 "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
                 "sys:x:3:3:sys:/dev:/usr/sbin/nologin\n",
-                "shadow": "root::19840:0:99999:7:::\n"
-                "daemon::19840:0:99999:7:::\n",
+                "shadow": "root:*:19840:0:99999:7:::\n"
+                "daemon:*:19840:0:99999:7:::\n",
                 "hosts": "127.0.0.1 localhost\n127.0.1.1 honeypot\n",
             },
-            "var": {"www": {"html": {"index.html": "<html><body>"}}},
+            "var": {"www": {"html": {"index.html": "<html><body>It works!</body></html>"}}},
             "home": {"admin": {"notes.txt": "password123\n"}, "user": {}},
             "tmp": {},
             "bin": {},
