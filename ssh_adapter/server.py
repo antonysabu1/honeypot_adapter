@@ -9,6 +9,7 @@ import paramiko
 
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
+from ssh_adapter.shell import FakeSSHShell
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
 
@@ -131,28 +132,29 @@ class SSHHandler(socketserver.BaseRequestHandler):
             return
 
         server.event.wait(10)
+        if chan is None:
+            return
 
-        try:
-            chan.send(b"Welcome to Ubuntu 22.04.3 LTS\r\n\r\n$ ")
-            while True:
-                data = chan.recv(1024)
-                if not data:
-                    break
-                chan.send(b"stub> " + data)
-        finally:
-            log_event(
-                _build_event(
-                    session_id=session_id,
-                    source_ip=self.client_address[0],
-                    protocol="ssh",
-                    action="connection_closed",
-                    parameters={},
-                    response_status="0",
-                    response_type="session_ended",
-                )
-            )
-            session_tracker.end_session(session_id)
-            transport.close()
+        shell = FakeSSHShell(chan, session_id, self.client_address[0])
+        shell.run()
+        # After shell exits, log connection_closed
+        log_event(
+            {
+                "event_id": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "protocol": "ssh",
+                "source_ip": self.client_address[0],
+                "session_id": session_id,
+                "action": "connection_closed",
+                "parameters": {},
+                "raw_metadata": {},
+                "session_source": "protocol_native",
+                "response_status": "0",
+                "response_type": "session_ended",
+            }
+        )
+        session_tracker.end_session(session_id)
+        transport.close()
 
 
 if __name__ == "__main__":
