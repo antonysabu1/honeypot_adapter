@@ -19,10 +19,12 @@ def decide_response(
 ) -> ResponsePlan:
     command = action.strip()
 
-    if command.startswith("ls"):
+    if action.strip().startswith("ls"):
         args = parameters.get("args", [])
-        if args:
-            path = args[0]
+        # Skip flags like -la, -a, -l
+        path_args = [a for a in args if not a.startswith("-")]
+        if path_args:
+            path = path_args[0]
         else:
             path = parameters.get("cwd", "/")
         contents = fs.ls(path)
