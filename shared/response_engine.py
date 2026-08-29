@@ -20,8 +20,11 @@ def decide_response(
     command = action.strip()
 
     if command.startswith("ls"):
-        args = parameters.get("args", ["/"])
-        path = args[0] if args else "/"
+        args = parameters.get("args", [])
+        if args:
+            path = args[0]
+        else:
+            path = parameters.get("cwd", "/")
         contents = fs.ls(path)
         content_str = "\n".join(contents) if contents else ""
         return ResponsePlan("directory_listing", content_str, "0")
