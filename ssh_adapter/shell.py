@@ -24,9 +24,7 @@ class FakeSSHShell:
         self.prompt = f"root@honeypot:{self._shorten_path(self.current_dir)}# "
 
     def run(self):
-        self.channel.send(
-            b"\r\nWelcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-105-generic x86_64)\r\n\r\n"
-        )
+        self.channel.send("\r\nWelcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-105-generic x86_64)\r\n\r\n".encode())
         self.channel.send(self.prompt.encode())
         buffer = b""
         while not self._closed:
@@ -36,10 +34,22 @@ class FakeSSHShell:
                 break
             if not data:
                 break
-            for byte in data:
-                if byte == 13:  # \r
-                    continue
-                elif byte == 10:  # \n
+
+            i = 0
+            while i < len(data):
+                byte = data[i]
+
+                if byte == 13:  # \r — Enter in PTY mode
+                    cmd = buffer.decode("utf-8", errors="ignore").strip()
+                    buffer = b""
+                    if cmd:
+                        self.handle_command(cmd)
+                    else:
+                        self.channel.send(("\r\n" + self.prompt).encode())
+                    # Skip the following \n if present (Windows/SSH clients send \r\n)
+                    if i + 1 < len(data) and data[i + 1] == 10:
+                        i += 1
+                elif byte == 10:  # \n — standalone newline
                     cmd = buffer.decode("utf-8", errors="ignore").strip()
                     buffer = b""
                     if cmd:
@@ -50,9 +60,15 @@ class FakeSSHShell:
                     if buffer:
                         buffer = buffer[:-1]
                         self.channel.send(b"\b \b")
-                else:
+                elif byte == 3:  # Ctrl+C
+                    buffer = b""
+                    self.channel.send(b"^C\r\n" + self.prompt.encode())
+                elif 32 <= byte <= 126:  # printable ASCII
                     buffer += bytes([byte])
                     self.channel.send(bytes([byte]))
+                # Ignore other control bytes silently
+
+                i += 1
 
     def handle_command(self, cmd: str):
         log_event(
