@@ -105,7 +105,9 @@ class FakeSSHShell:
             self.current_dir = path
             self._update_prompt()
 
-        self.channel.send(("\r\n" + response.content + "\r\n" + self.prompt).encode())
+        # Normalize \n to \r\n for PTY display
+        content = response.content.replace("\n", "\r\n")
+        self.channel.send(("\r\n" + content + "\r\n" + self.prompt).encode())
 
         log_event(
             {
