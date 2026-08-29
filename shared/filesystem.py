@@ -14,7 +14,10 @@ class FakeFilesystem:
             "home": {"admin": {"notes.txt": "password123\n"}, "user": {}},
             "tmp": {},
             "bin": {},
-            "root": {},  # empty directory
+            "root": {
+                "flag.txt": "flag{you_got_pwned}\n",
+                "README": "Do not delete this file.\n",
+            },
             "usr": {"bin": {}},
         }
 

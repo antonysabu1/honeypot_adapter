@@ -71,6 +71,10 @@ class FakeSSHShell:
                 i += 1
 
     def handle_command(self, cmd: str):
+        # FIX: Rewrite bare "cd" BEFORE decide_response
+        if cmd.strip() == "cd":
+            cmd = "cd /root"
+
         log_event(
             {
                 "event_id": str(uuid.uuid4()),
@@ -99,9 +103,6 @@ class FakeSSHShell:
             self.channel.send("\r\nlogout\r\n".encode())
             self._closed = True
             return
-
-        if cmd.strip() == "cd":
-            cmd = "cd /root"
 
         if cmd.startswith("cd "):
             path = cmd[3:].strip()
