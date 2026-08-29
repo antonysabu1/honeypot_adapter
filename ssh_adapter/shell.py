@@ -88,7 +88,11 @@ class FakeSSHShell:
         )
 
         response = decide_response(
-            "ssh", self.session_id, cmd, {"args": self._parse_args(cmd)}, self.fs
+            "ssh",
+            self.session_id,
+            cmd,
+            {"args": self._parse_args(cmd), "cwd": self.current_dir},
+            self.fs,
         )
 
         if response.response_type == "session_end":
