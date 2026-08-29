@@ -136,25 +136,26 @@ class SSHHandler(socketserver.BaseRequestHandler):
             return
 
         shell = FakeSSHShell(chan, session_id, self.client_address[0])
-        shell.run()
-        # After shell exits, log connection_closed
-        log_event(
-            {
-                "event_id": str(uuid.uuid4()),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "protocol": "ssh",
-                "source_ip": self.client_address[0],
-                "session_id": session_id,
-                "action": "connection_closed",
-                "parameters": {},
-                "raw_metadata": {},
-                "session_source": "protocol_native",
-                "response_status": "0",
-                "response_type": "session_ended",
-            }
-        )
-        session_tracker.end_session(session_id)
-        transport.close()
+        try:
+            shell.run()
+        finally:
+            log_event(
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "protocol": "ssh",
+                    "source_ip": self.client_address[0],
+                    "session_id": session_id,
+                    "action": "connection_closed",
+                    "parameters": {},
+                    "raw_metadata": {},
+                    "session_source": "protocol_native",
+                    "response_status": "0",
+                    "response_type": "session_ended",
+                }
+            )
+            session_tracker.end_session(session_id)
+            transport.close()
 
 
 if __name__ == "__main__":

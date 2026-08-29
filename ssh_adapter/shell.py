@@ -8,10 +8,12 @@ from shared.filesystem import FakeFilesystem
 
 
 class FakeSSHShell:
+    # SAFETY: No real auth — always returns success
     def __init__(self, channel, session_id, source_ip):
         self.channel = channel
         self.session_id = session_id
         self.source_ip = source_ip
+        # SAFETY: No real file access — uses FakeFilesystem
         self.fs = FakeFilesystem()
         self.current_dir = "/root"
         self.prompt = "root@honeypot:~# "
@@ -91,6 +93,7 @@ class FakeSSHShell:
             }
         )
 
+        # SAFETY: No subprocess/os.system — all responses via decide_response()
         response = decide_response(
             "ssh",
             self.session_id,
