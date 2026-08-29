@@ -111,9 +111,54 @@ class FakeSSHShell:
             path = cmd[3:].strip()
             if not path:
                 path = "/root"
-            if not path.startswith("/"):
+            elif not path.startswith("/"):
                 path = os.path.join(self.current_dir, path)
-            self.current_dir = path
+
+            # Normalize: /root/../etc → /etc, /root/.... → /root/....
+            normalized = os.path.normpath(path)
+
+            # Validate against FakeFilesystem
+            if not self.fs.exists(normalized):
+                error_msg = f"bash: cd: {path}: No such file or directory"
+                self.channel.send(("\r\n" + error_msg + "\r\n" + self.prompt).encode())
+                # Log the failed attempt
+                log_event(
+                    {
+                        "event_id": str(uuid.uuid4()),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "protocol": "ssh",
+                        "source_ip": self.source_ip,
+                        "session_id": self.session_id,
+                        "action": cmd,
+                        "parameters": {"command": cmd, "target": path},
+                        "raw_metadata": {},
+                        "session_source": "protocol_native",
+                        "response_status": "1",
+                        "response_type": "cd_failed",
+                    }
+                )
+                return
+            if not self.fs.is_dir(normalized):
+                error_msg = f"bash: cd: {path}: Not a directory"
+                self.channel.send(("\r\n" + error_msg + "\r\n" + self.prompt).encode())
+                log_event(
+                    {
+                        "event_id": str(uuid.uuid4()),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "protocol": "ssh",
+                        "source_ip": self.source_ip,
+                        "session_id": self.session_id,
+                        "action": cmd,
+                        "parameters": {"command": cmd, "target": path},
+                        "raw_metadata": {},
+                        "session_source": "protocol_native",
+                        "response_status": "1",
+                        "response_type": "cd_failed",
+                    }
+                )
+                return
+
+            self.current_dir = normalized
             self._update_prompt()
 
         # Normalize \n to \r\n for PTY display
