@@ -136,6 +136,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
             return
 
         shell = FakeSSHShell(chan, session_id, self.client_address[0])
+        # SAFETY: No subprocess/os.system — all responses via decide_response()
         try:
             shell.run()
         finally:
