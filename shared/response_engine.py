@@ -50,7 +50,7 @@ def decide_response(
             "0",
         )
 
-    if command.startswith("cd "):
+    if command == "cd" or command.startswith("cd "):
         return ResponsePlan("command_output", "", "0")
 
     if command == "exit":
