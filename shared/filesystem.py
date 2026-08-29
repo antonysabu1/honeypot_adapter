@@ -14,6 +14,7 @@ class FakeFilesystem:
             "home": {"admin": {"notes.txt": "password123\n"}, "user": {}},
             "tmp": {},
             "bin": {},
+            "root": {},  # empty directory
             "usr": {"bin": {}},
         }
 
