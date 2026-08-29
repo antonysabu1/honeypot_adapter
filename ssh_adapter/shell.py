@@ -100,6 +100,9 @@ class FakeSSHShell:
             self._closed = True
             return
 
+        if cmd.strip() == "cd":
+            cmd = "cd /root"
+
         if cmd.startswith("cd "):
             path = cmd[3:].strip()
             if not path:
