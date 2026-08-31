@@ -94,11 +94,19 @@ class FakeSSHShell:
         )
 
         # SAFETY: No subprocess/os.system — all responses via decide_response()
+        args = self._parse_args(cmd)
+        resolved_args = []
+        for arg in args:
+            if arg.startswith("/"):
+                resolved_args.append(arg)
+            else:
+                resolved_args.append(os.path.join(self.current_dir, arg))
+
         response = decide_response(
             "ssh",
             self.session_id,
             cmd,
-            {"args": self._parse_args(cmd), "cwd": self.current_dir},
+            {"args": resolved_args, "cwd": self.current_dir},
             self.fs,
         )
 
