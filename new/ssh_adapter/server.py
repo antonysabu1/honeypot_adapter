@@ -159,9 +159,13 @@ class SSHHandler(socketserver.BaseRequestHandler):
             transport.close()
 
 
-if __name__ == "__main__":
+def start_server():
     server = socketserver.ThreadingTCPServer(("", 2222), SSHHandler)
     server.allow_reuse_address = True
     server.daemon_threads = True
     print("SSH honeypot listening on port 2222")
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    start_server()

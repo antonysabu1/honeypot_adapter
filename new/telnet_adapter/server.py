@@ -75,10 +75,12 @@ class TelnetServer(asyncio.Protocol):
         session_tracker.end_session(self.session_id)
 
 
-if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    coro = loop.create_server(TelnetServer, "0.0.0.0", 2323)
-    server = loop.run_until_complete(coro)
+async def start_server():
+    loop = asyncio.get_event_loop()
+    server = await loop.create_server(TelnetServer, "0.0.0.0", 2323)
     print("Telnet honeypot listening on port 2323")
-    loop.run_forever()
+    await asyncio.Future()  # run forever
+
+
+if __name__ == "__main__":
+    asyncio.run(start_server())
