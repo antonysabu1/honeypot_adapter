@@ -3,4 +3,6 @@ __pycache__/
 .venv/
 venv/
 logs/
-ssh_adapter/host_key
+**/host_key
+**/logs/
+old/

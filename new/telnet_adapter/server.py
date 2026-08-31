@@ -4,6 +4,7 @@ import uuid
 
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
+from telnet_adapter.session import TelnetSession
 
 
 def _build_event(
@@ -52,26 +53,11 @@ class TelnetServer(asyncio.Protocol):
         )
 
         self.transport.write(b"\r\nWelcome to Ubuntu 22.04 LTS\r\n\r\n")
+        self.transport.write(b"login: ")
+        self.session = TelnetSession(self.transport, self.session_id, self.source_ip)
 
     def data_received(self, data):
-        i = 0
-        while i < len(data):
-            byte = data[i]
-            if byte == 255:  # IAC — skip 3-byte sequence
-                i += 3
-                continue
-            if byte in (13, 10):  # \r or \n
-                if self.buffer:
-                    self.handle_data(self.buffer.decode("utf-8", errors="ignore"))
-                    self.buffer = b""
-                i += 1
-                continue
-            self.buffer += bytes([byte])
-            i += 1
-
-    def handle_data(self, line):
-        # Part 9 will implement login/shell
-        pass
+        self.session.handle_data(data)
 
     def connection_lost(self, exc):
         log_event(
