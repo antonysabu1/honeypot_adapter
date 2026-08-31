@@ -8,10 +8,12 @@ from shared.filesystem import FakeFilesystem
 
 
 class TelnetSession:
+    # SAFETY: No real auth — always returns success
     def __init__(self, transport, session_id, source_ip):
         self.transport = transport
         self.session_id = session_id
         self.source_ip = source_ip
+        # SAFETY: No real file access — uses FakeFilesystem
         self.fs = FakeFilesystem()
         self.state = "login"
         self.username = ""
@@ -96,6 +98,7 @@ class TelnetSession:
                 }
             )
 
+            # SAFETY: No subprocess/os.system — all responses via decide_response()
             response = decide_response(
                 "telnet",
                 self.session_id,

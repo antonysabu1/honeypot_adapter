@@ -57,6 +57,7 @@ class TelnetServer(asyncio.Protocol):
         self.session = TelnetSession(self.transport, self.session_id, self.source_ip)
 
     def data_received(self, data):
+        # SAFETY: No subprocess/os.system — all responses via decide_response()
         self.session.handle_data(data)
 
     def connection_lost(self, exc):
