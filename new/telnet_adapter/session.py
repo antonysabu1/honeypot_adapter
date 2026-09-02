@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from shared.logger import log_event
 from shared.response_engine import decide_response
 from shared.filesystem import FakeFilesystem
+from shared.mitre import mitre_tag
 
 
 class TelnetSession:
@@ -64,6 +65,7 @@ class TelnetSession:
                     "session_source": "protocol_native",
                     "response_status": "authenticated",
                     "response_type": "fake_auth_success",
+                    "mitre_attack_id": "T1078",
                 }
             )
             self.transport.write(b"\r\n\r\n")
@@ -95,6 +97,7 @@ class TelnetSession:
                     "session_source": "protocol_native",
                     "response_status": "0",
                     "response_type": "pending",
+                    "mitre_attack_id": mitre_tag(line),
                 }
             )
 
@@ -141,6 +144,7 @@ class TelnetSession:
                             "session_source": "protocol_native",
                             "response_status": "1",
                             "response_type": "cd_failed",
+                            "mitre_attack_id": mitre_tag(line),
                         }
                     )
                     return
@@ -162,6 +166,7 @@ class TelnetSession:
                             "session_source": "protocol_native",
                             "response_status": "1",
                             "response_type": "cd_failed",
+                            "mitre_attack_id": mitre_tag(line),
                         }
                     )
                     return
@@ -183,6 +188,7 @@ class TelnetSession:
                         "session_source": "protocol_native",
                         "response_status": "0",
                         "response_type": "command_output",
+                        "mitre_attack_id": mitre_tag(line),
                     }
                 )
                 return
@@ -202,6 +208,7 @@ class TelnetSession:
                     "session_source": "protocol_native",
                     "response_status": response.status,
                     "response_type": response.response_type,
+                    "mitre_attack_id": mitre_tag(line),
                 }
             )
 
