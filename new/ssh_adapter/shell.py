@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from shared.logger import log_event
 from shared.response_engine import decide_response
 from shared.filesystem import FakeFilesystem
-from shared.mitre import mitre_tag
+from shared.mitre import mitre_analyze
 
 
 class FakeSSHShell:
@@ -78,6 +78,8 @@ class FakeSSHShell:
         if cmd.strip() == "cd":
             cmd = "cd /root"
 
+        mitre = mitre_analyze(cmd)
+
         log_event(
             {
                 "event_id": str(uuid.uuid4()),
@@ -91,7 +93,7 @@ class FakeSSHShell:
                 "session_source": "protocol_native",
                 "response_status": "0",
                 "response_type": "pending",
-                "mitre_attack_id": mitre_tag(cmd),
+                **mitre,
             }
         )
 
@@ -145,7 +147,7 @@ class FakeSSHShell:
                         "session_source": "protocol_native",
                         "response_status": "1",
                         "response_type": "cd_failed",
-                        "mitre_attack_id": mitre_tag(cmd),
+                        **mitre,
                     }
                 )
                 return
@@ -165,7 +167,7 @@ class FakeSSHShell:
                         "session_source": "protocol_native",
                         "response_status": "1",
                         "response_type": "cd_failed",
-                        "mitre_attack_id": mitre_tag(cmd),
+                        **mitre,
                     }
                 )
                 return
@@ -190,7 +192,7 @@ class FakeSSHShell:
                 "session_source": "protocol_native",
                 "response_status": response.status,
                 "response_type": response.response_type,
-                "mitre_attack_id": mitre_tag(cmd),
+                **mitre,
             }
         )
 

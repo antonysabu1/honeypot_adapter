@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from shared.logger import log_event
 from shared.response_engine import decide_response
 from shared.filesystem import FakeFilesystem
-from shared.mitre import mitre_tag
+from shared.mitre import mitre_analyze
 
 
 class TelnetSession:
@@ -66,6 +66,11 @@ class TelnetSession:
                     "response_status": "authenticated",
                     "response_type": "fake_auth_success",
                     "mitre_attack_id": "T1078",
+                    "mitre_technique_name": "Valid Accounts",
+                    "mitre_tactic": "Initial Access",
+                    "mitre_attack_id_secondary": None,
+                    "mitre_technique_name_secondary": None,
+                    "mitre_confidence": "high",
                 }
             )
             self.transport.write(b"\r\n\r\n")
@@ -84,6 +89,8 @@ class TelnetSession:
                 else:
                     resolved_args.append(os.path.join(self.current_dir, arg))
 
+            mitre = mitre_analyze(line)
+
             log_event(
                 {
                     "event_id": str(uuid.uuid4()),
@@ -97,7 +104,7 @@ class TelnetSession:
                     "session_source": "protocol_native",
                     "response_status": "0",
                     "response_type": "pending",
-                    "mitre_attack_id": mitre_tag(line),
+                    **mitre,
                 }
             )
 
@@ -144,7 +151,7 @@ class TelnetSession:
                             "session_source": "protocol_native",
                             "response_status": "1",
                             "response_type": "cd_failed",
-                            "mitre_attack_id": mitre_tag(line),
+                            **mitre,
                         }
                     )
                     return
@@ -166,7 +173,7 @@ class TelnetSession:
                             "session_source": "protocol_native",
                             "response_status": "1",
                             "response_type": "cd_failed",
-                            "mitre_attack_id": mitre_tag(line),
+                            **mitre,
                         }
                     )
                     return
@@ -188,7 +195,7 @@ class TelnetSession:
                         "session_source": "protocol_native",
                         "response_status": "0",
                         "response_type": "command_output",
-                        "mitre_attack_id": mitre_tag(line),
+                        **mitre,
                     }
                 )
                 return
@@ -208,7 +215,7 @@ class TelnetSession:
                     "session_source": "protocol_native",
                     "response_status": response.status,
                     "response_type": response.response_type,
-                    "mitre_attack_id": mitre_tag(line),
+                    **mitre,
                 }
             )
 
