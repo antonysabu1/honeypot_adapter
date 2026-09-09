@@ -10,13 +10,16 @@ from shared.mitre import mitre_analyze
 
 class FakeSSHShell:
     # SAFETY: No real auth — always returns success
-    def __init__(self, channel, session_id, source_ip):
+    def __init__(self, channel, session_id, source_ip, username="root"):
         self.channel = channel
         self.session_id = session_id
         self.source_ip = source_ip
+        self.username = username or "root"
         # SAFETY: No real file access — uses FakeFilesystem
         self.fs = FakeFilesystem()
         self.current_dir = "/root"
+        # The honeypot always presents a root shell; only whoami reflects the
+        # actual login user (per session-isolation report recommendation).
         self.prompt = "root@honeypot:~# "
         self._closed = False
 
@@ -28,6 +31,13 @@ class FakeSSHShell:
 
     def run(self):
         self.channel.send("\r\nWelcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-105-generic x86_64)\r\n\r\n".encode())
+        motd = (
+            " * Documentation:  https://help.ubuntu.com\r\n"
+            " * Management:     https://landscape.canonical.com\r\n"
+            " * Support:        https://ubuntu.com/advantage\r\n\r\n"
+            "Last login: Mon Sep  8 10:42:13 2026 from 192.168.1.100\r\n\r\n"
+        )
+        self.channel.send(motd.encode())
         self.channel.send(self.prompt.encode())
         buffer = b""
         while not self._closed:
@@ -101,7 +111,9 @@ class FakeSSHShell:
         args = self._parse_args(cmd)
         resolved_args = []
         for arg in args:
-            if arg.startswith("/"):
+            # Absolute paths stay untouched; flags (e.g. -la) must NOT be joined
+            # to the cwd or decide_response can't recognize them.
+            if arg.startswith("/") or arg.startswith("-"):
                 resolved_args.append(arg)
             else:
                 resolved_args.append(os.path.join(self.current_dir, arg))
@@ -112,10 +124,27 @@ class FakeSSHShell:
             cmd,
             {"args": resolved_args, "cwd": self.current_dir},
             self.fs,
+            username=self.username,
         )
 
         if response.response_type == "session_end":
             self.channel.send("\r\nlogout\r\n".encode())
+            log_event(
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "protocol": "ssh",
+                    "source_ip": self.source_ip,
+                    "session_id": self.session_id,
+                    "action": cmd,
+                    "parameters": {"command": cmd},
+                    "raw_metadata": {},
+                    "session_source": "protocol_native",
+                    "response_status": "0",
+                    "response_type": "session_end",
+                    **mitre,
+                }
+            )
             self._closed = True
             return
 

@@ -28,6 +28,13 @@ def _build_event(
         "session_source": "protocol_native",
         "response_status": response_status,
         "response_type": response_type,
+        # Lifecycle events are not attacker commands, so MITRE fields are null.
+        "mitre_attack_id": None,
+        "mitre_technique_name": None,
+        "mitre_tactic": None,
+        "mitre_attack_id_secondary": None,
+        "mitre_technique_name_secondary": None,
+        "mitre_confidence": None,
     }
 
 

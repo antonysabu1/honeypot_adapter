@@ -46,6 +46,13 @@ def _build_event(
         "session_source": "protocol_native",
         "response_status": response_status,
         "response_type": response_type,
+        # Lifecycle events are not attacker commands, so MITRE fields are null.
+        "mitre_attack_id": None,
+        "mitre_technique_name": None,
+        "mitre_tactic": None,
+        "mitre_attack_id_secondary": None,
+        "mitre_technique_name_secondary": None,
+        "mitre_confidence": None,
     }
 
 
@@ -54,6 +61,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         self.session_id = session_id
         self.client_address = client_address
         self.event = threading.Event()
+        self.username = None
 
     def check_channel_request(self, kind, chanid):
         if kind == "session":
@@ -61,6 +69,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
     def check_auth_password(self, username, password):
+        self.username = username
         log_event(
             _build_event(
                 session_id=self.session_id,
@@ -75,6 +84,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         return paramiko.AUTH_SUCCESSFUL
 
     def check_auth_publickey(self, username, key):
+        self.username = username
         log_event(
             _build_event(
                 session_id=self.session_id,
@@ -135,7 +145,12 @@ class SSHHandler(socketserver.BaseRequestHandler):
         if chan is None:
             return
 
-        shell = FakeSSHShell(chan, session_id, self.client_address[0])
+        shell = FakeSSHShell(
+            chan,
+            session_id,
+            self.client_address[0],
+            username=server.username or "root",
+        )
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         try:
             shell.run()
@@ -153,6 +168,12 @@ class SSHHandler(socketserver.BaseRequestHandler):
                     "session_source": "protocol_native",
                     "response_status": "0",
                     "response_type": "session_ended",
+                    "mitre_attack_id": None,
+                    "mitre_technique_name": None,
+                    "mitre_tactic": None,
+                    "mitre_attack_id_secondary": None,
+                    "mitre_technique_name_secondary": None,
+                    "mitre_confidence": None,
                 }
             )
             session_tracker.end_session(session_id)
