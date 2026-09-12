@@ -109,20 +109,16 @@ class FakeSSHShell:
 
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         args = self._parse_args(cmd)
-        resolved_args = []
-        for arg in args:
-            # Absolute paths stay untouched; flags (e.g. -la) must NOT be joined
-            # to the cwd or decide_response can't recognize them.
-            if arg.startswith("/") or arg.startswith("-"):
-                resolved_args.append(arg)
-            else:
-                resolved_args.append(os.path.join(self.current_dir, arg))
+        # Relative file paths are resolved against cwd inside decide_response()
+        # via _resolve_path; args are passed through untouched so flags and
+        # non-path operands (e.g. `which bash`, `date +%Y`, `find -name ...`)
+        # are not corrupted by cwd-joining.
 
         response = decide_response(
             "ssh",
             self.session_id,
             cmd,
-            {"args": resolved_args, "cwd": self.current_dir},
+            {"args": args, "cwd": self.current_dir},
             self.fs,
             username=self.username,
         )

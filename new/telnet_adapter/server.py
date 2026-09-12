@@ -45,7 +45,7 @@ class TelnetServer(asyncio.Protocol):
         self.source_ip = transport.get_extra_info("peername")[0]
         self.buffer = b""
 
-        session_tracker.start_session(self.source_ip, "telnet")
+        session_tracker.start_session(self.source_ip, "telnet", self.session_id)
 
         log_event(
             _build_event(
@@ -76,7 +76,7 @@ class TelnetServer(asyncio.Protocol):
                 action="connection_closed",
                 parameters={},
                 response_status="0",
-                response_type="session_ended",
+                response_type="session_end",
             )
         )
         session_tracker.end_session(self.session_id)
