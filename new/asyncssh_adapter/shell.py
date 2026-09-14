@@ -22,7 +22,11 @@ from shared.events import build_event
 from shared.filesystem import FakeFilesystem
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
-from shared.response_engine import decide_line, decide_response, is_chained
+from shared.response_engine import (
+    decide_line,
+    decide_response,
+    has_shell_syntax,
+)
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
@@ -108,9 +112,9 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
 
         args = parse_args(cmd)
 
-        # `;` / `&&` / `||` lines go to the shared sequencer, which also resolves
-        # any `cd` segment and hands back the resulting cwd.
-        chained = is_chained(cmd)
+        # `;` / `&&` / `||` / `|` / redirection lines go to the shared line path,
+        # which also resolves any `cd` segment and hands back the resulting cwd.
+        chained = has_shell_syntax(cmd)
         if chained:
             response, new_cwd = decide_line(
                 "ssh",
@@ -148,9 +152,13 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         content = response.content.replace("\n", "\r\n")
         self._write(("\r\n" + content + "\r\n" + self.prompt).encode())
 
+        # A redirected write target is intel: record it, never print it.
+        params = {"command": cmd}
+        if response.redirect:
+            params["redirect"] = response.redirect
         log_event(build_event(
             self.session_id, self.source_ip, "ssh", cmd,
-            {"command": cmd}, response.status, response.response_type,
+            params, response.status, response.response_type,
             mitre=mitre,
         ))
 
@@ -186,7 +194,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         ))
 
         args = parse_args(cmd)
-        if is_chained(cmd):
+        if has_shell_syntax(cmd):
             response, self.current_dir = decide_line(
                 "ssh",
                 self.session_id,
@@ -211,9 +219,13 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         if response is not None and response.content:
             self._write(response.content.encode())
 
+        # A redirected write target is intel: record it, never print it.
+        params = {"command": cmd}
+        if response is not None and response.redirect:
+            params["redirect"] = response.redirect
         log_event(build_event(
             self.session_id, self.source_ip, "ssh", cmd,
-            {"command": cmd}, response.status if response else "0",
+            params, response.status if response else "0",
             response.response_type if response else "command_output",
             mitre=mitre,
         ))

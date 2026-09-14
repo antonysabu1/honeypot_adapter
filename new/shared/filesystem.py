@@ -253,6 +253,33 @@ class FakeFilesystem:
                 return None
         return node
 
+    def write(self, path: str, content: str, append: bool = False) -> bool:
+        """Write into the simulated tree only — never the real filesystem.
+
+        Returns False when the path cannot be written (missing parent
+        directory, or a parent that is a file), which is what bash fails on
+        too, so `cmd > /root/new/file` reports an error rather than inventing
+        directories.
+        """
+        parts = [part for part in path.split("/") if part != ""]
+        if not parts:
+            return False
+        node = self._tree
+        for part in parts[:-1]:
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                return False
+        if not isinstance(node, dict):
+            return False
+
+        leaf = parts[-1]
+        existing = node.get(leaf)
+        if isinstance(existing, dict):
+            return False
+        node[leaf] = ((existing or "") + content) if append else content
+        return True
+
     def exists(self, path: str) -> bool:
         return self._resolve(path) is not None
 

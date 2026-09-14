@@ -5,12 +5,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from shared.filesystem import FakeFilesystem
+from shared.shell import resolve_cd
+from shared.shell_syntax import (
+    apply_filter,
+    is_devnull,
+    parse_segment,
+    split_streams,
+    visible_output,
+)
 
 @dataclass
 class ResponsePlan:
     response_type: str
     content: str
     status: str
+    # Where the line's output was routed, when it was redirected. Recorded as
+    # intel by the transports instead of being shown to the attacker.
+    redirect: str | None = None
 
 def _fake_date() -> str:
     """GNU `date`-style output (UTC, like a server misconfigured for realism)."""
@@ -37,6 +48,12 @@ def _cmd_ls(ctx: _Ctx) -> ResponsePlan | None:
         path_args = [a for a in ctx.args if not a.startswith('-')]
         show_all = any(('a' in a for a in ctx.args if a.startswith('-')))
         path = _resolve_path(path_args[0], ctx.cwd) if path_args else ctx.cwd
+        # bash complains instead of silently printing nothing, and exits 2.
+        if not ctx.fs.exists(path):
+            return ResponsePlan('command_not_found',
+                                f"ls: cannot access '{path}': No such file or directory\n", '2')
+        if ctx.fs.is_file(path):
+            return ResponsePlan('directory_listing', path + '\n', '0')
         contents = ctx.fs.ls(path) or []
         if not show_all:
             contents = [c for c in contents if not c.startswith('.')]
@@ -47,7 +64,30 @@ def _cmd_ls(ctx: _Ctx) -> ResponsePlan | None:
 def _cmd_cat(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd.startswith('cat '):
         p = _resolve_path(ctx.args[0], ctx.cwd) if ctx.args else _resolve_path(ctx.cmd[4:].strip(), ctx.cwd)
-        return ResponsePlan('file_contents', ctx.fs.cat(p), '0')
+        # A missing file is a failure in bash, so `cat /nope && whoami` must not
+        # run the second command. The message stays as it was.
+        status = '0' if ctx.fs.is_file(p) else '1'
+        return ResponsePlan('file_contents', ctx.fs.cat(p), status)
+    return None
+
+def _cmd_grep(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'grep':
+        # The pattern is the first operand and the file the one after it.
+        operands = [a for a in ctx.args if a and not a.startswith('-')]
+        if len(operands) < 2:
+            return ResponsePlan('command_not_found', 'grep: missing file operand\n', '127')
+        p = _resolve_path(operands[1], ctx.cwd)
+        if ctx.fs.is_dir(p):
+            return ResponsePlan('command_not_found', f'grep: {p}: Is a directory\n', '2')
+        if not ctx.fs.is_file(p):
+            return ResponsePlan('command_not_found',
+                                f'grep: {p}: No such file or directory\n', '2')
+        # The same matcher the pipeline stage uses, so `grep x f` and
+        # `cat f | grep x` can never disagree. Status 1 means "no match".
+        filtered = apply_filter(ctx.cmd, ctx.fs.cat(p))
+        if filtered is None:
+            return ResponsePlan('command_not_found', 'grep: missing pattern\n', '2')
+        return ResponsePlan('command_output', filtered[0], filtered[1])
     return None
 
 def _cmd_pwd(ctx: _Ctx) -> ResponsePlan | None:
@@ -271,9 +311,11 @@ def _cmd_wc(ctx: _Ctx) -> ResponsePlan | None:
             return ResponsePlan('command_not_found', 'wc: missing file operand\n', '127')
         data = ctx.fs.cat(p)
         lines = data.splitlines() if data else []
-        nlines = len(lines)
+        # bash prints the byte/word counts only when they were asked for.
+        if '-l' in ctx.args:
+            return ResponsePlan('command_output', f'{len(lines)} {p}\n', '0')
         nbytes = len(data.encode('utf-8'))
-        return ResponsePlan('command_output', f'{nlines} {nbytes} {p}\n', '0')
+        return ResponsePlan('command_output', f'{len(lines)} {len(data.split())} {nbytes} {p}\n', '0')
     return None
 
 def _cmd_cut(ctx: _Ctx) -> ResponsePlan | None:
@@ -560,6 +602,7 @@ def _cmd_ssh(ctx: _Ctx) -> ResponsePlan | None:
 _ROUTES: tuple = (
     _cmd_ls,
     _cmd_cat,
+    _cmd_grep,
     _cmd_pwd,
     _cmd_whoami,
     _cmd_uname,
@@ -756,6 +799,88 @@ def is_chained(line: str) -> bool:
     """True when the line carries shell sequencing rather than one command."""
     return len(_tokenize(line)) > 1
 
+
+def has_shell_syntax(line: str) -> bool:
+    """True when the line needs the line-level path, not decide_response().
+
+    That is sequencing (`;`, `&&`, `||`), a pipeline (`|`) or a redirection.
+    """
+    if is_chained(line):
+        return True
+    stages, red = parse_segment(line)
+    return len(stages) > 1 or red.any
+
+
+def _run_pipeline(
+    stages: list[str],
+    cwd: str,
+    fs: FakeFilesystem,
+    protocol: str,
+    session_id: str,
+    username: str,
+) -> tuple[ResponsePlan, str]:
+    """Run one pipeline stage by stage, feeding stdout into the next stage."""
+    first = stages[0]
+    plan = decide_response(
+        protocol,
+        session_id,
+        first,
+        {"args": first.split()[1:], "cwd": cwd},
+        fs,
+        username=username,
+    )
+    text, status = plan.content, plan.status
+
+    for stage in stages[1:]:
+        if status != "0":
+            # The upstream complained and produced nothing to pipe; its error
+            # is what the attacker sees. Bash would also run the filter on
+            # empty input, which would only add a misleading status.
+            break
+        filtered = apply_filter(stage, text)
+        if filtered is None:
+            name = stage.split()[0] if stage.split() else stage
+            # Unrecognised stages are refused, never guessed or forwarded.
+            return ResponsePlan(
+                "command_not_found", f"bash: {name}: command not found\n", "127"
+            ), cwd
+        text, status = filtered
+
+    return ResponsePlan(plan.response_type, text, status), cwd
+
+
+def _apply_redirections(
+    plan: ResponsePlan, red, cwd: str, fs: FakeFilesystem
+) -> ResponsePlan:
+    """Honour a segment's redirections and record where output went."""
+    if not red.any:
+        return plan
+
+    stdout_text, stderr_text = split_streams(plan.content, plan.status)
+    visible, writes = visible_output(stdout_text, stderr_text, red)
+
+    redirects = ",".join(red.targets()) or None
+    for target, text in writes:
+        # A redirection writes lines, so the text lands newline-terminated the
+        # way a command's stdout normally is.
+        if text and not text.endswith("\n"):
+            text += "\n"
+        if not fs.write(_resolve_path(target, cwd), text, append=red.append):
+            # bash refuses an unwritable target instead of pretending it wrote.
+            return ResponsePlan(
+                "command_output",
+                f"bash: {target}: No such file or directory\n",
+                "1",
+                redirect=redirects,
+            )
+
+    return ResponsePlan(
+        plan.response_type,
+        visible,
+        plan.status,
+        redirect=redirects,
+    )
+
 def _run_segment(
     segment: str,
     cwd: str,
@@ -764,29 +889,26 @@ def _run_segment(
     session_id: str,
     username: str,
 ) -> tuple[ResponsePlan, str]:
-    """Run one `;`-separated segment, resolving `cd` against the fake FS."""
-    if segment == "cd" or segment.startswith("cd "):
-        target = segment[2:].strip() or "/root"
-        joined = target if target.startswith("/") else os.path.join(cwd, target)
-        normalized = os.path.normpath(joined)
-        if not fs.exists(normalized):
-            return ResponsePlan(
-                "cd_failed", f"bash: cd: {joined}: No such file or directory", "1"
-            ), cwd
-        if not fs.is_dir(normalized):
-            return ResponsePlan("cd_failed", f"bash: cd: {joined}: Not a directory", "1"), cwd
-        return ResponsePlan("command_output", "", "0"), normalized
+    """Run one `;`-separated segment: its pipeline, redirections and `cd`."""
+    stages, red = parse_segment(segment)
+    if not stages:
+        # A line that is only redirections (`> /tmp/f`) still creates the file
+        # and exits 0, the way bash does. Reads are never written to.
+        for target in (red.stdout_target, red.stderr_target):
+            if target and not is_devnull(target):
+                fs.write(_resolve_path(target, cwd), "")
+        return ResponsePlan("command_output", "", "0",
+                            redirect=",".join(red.targets()) or None), cwd
 
-    args = segment.split()[1:]
-    plan = decide_response(
-        protocol,
-        session_id,
-        segment,
-        {"args": args, "cwd": cwd},
-        fs,
-        username=username,
-    )
-    return plan, cwd
+    # `cd` is shell state, not a stage: it is never piped or redirected.
+    if len(stages) == 1 and (stages[0] == "cd" or stages[0].startswith("cd ")):
+        result = resolve_cd(stages[0][2:].strip(), cwd, fs)
+        if result.ok:
+            return ResponsePlan("command_output", "", "0"), result.cwd
+        return ResponsePlan("cd_failed", result.error, "1"), cwd
+
+    plan, new_cwd = _run_pipeline(stages, cwd, fs, protocol, session_id, username)
+    return _apply_redirections(plan, red, cwd, fs), new_cwd
 
 def decide_line(
     protocol: str,
@@ -803,15 +925,15 @@ def decide_line(
     executed, and output is the concatenation of every segment that ran.
     """
     cwd = parameters.get("cwd", "/")
-    tokens = _tokenize(action)
-    if len(tokens) <= 1:
+    if not has_shell_syntax(action):
+        # One plain command: unchanged single-command behaviour.
         return decide_response(
             protocol, session_id, action, parameters, fs, username=username
         ), cwd
 
-    output: list[str] = []
+    tokens = _tokenize(action)
+    ran: list[ResponsePlan] = []
     status = "0"
-    response_type = "command_output"
     for connector, segment in tokens:
         if not segment:
             continue
@@ -822,13 +944,30 @@ def decide_line(
 
         plan, cwd = _run_segment(segment, cwd, fs, protocol, session_id, username)
         status = plan.status
-        response_type = plan.response_type
         if plan.response_type == "session_end":
             return ResponsePlan("session_end", plan.content, plan.status), cwd
-        if plan.content:
-            output.append(plan.content.rstrip("\n"))
+        ran.append(plan)
 
-    return ResponsePlan(response_type, "\n".join(output), status), cwd
+    if len(tokens) <= 1:
+        # A pipeline or redirection is still one command line, so its output is
+        # that command's output, newline and all. Sequencing keeps its own
+        # join-below behaviour, which the chaining tests pin.
+        return ran[0] if ran else ResponsePlan("command_output", ""), cwd
+
+    output = [plan.content.rstrip("\n") for plan in ran if plan.content]
+    response_type = ran[-1].response_type if ran else "command_output"
+    redirects: list[str] = []
+    for plan in ran:
+        if plan.redirect and plan.redirect not in redirects:
+            redirects.append(plan.redirect)
+
+    return ResponsePlan(
+        response_type,
+        "\n".join(output),
+        status,
+        redirect=",".join(redirects) if redirects else None,
+    ), cwd
+
 
 def _take_num(args: list, default: int) -> int:
     for i, a in enumerate(args):

@@ -2,7 +2,11 @@ from shared.events import build_event
 from shared.filesystem import FakeFilesystem
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
-from shared.response_engine import decide_line, decide_response, is_chained
+from shared.response_engine import (
+    decide_line,
+    decide_response,
+    has_shell_syntax,
+)
 from shared.shell import (
     POST_LOGIN_BANNER,
     parse_args,
@@ -150,9 +154,9 @@ class TelnetSession:
             self._log(line, "0", "pending", mitre)
 
             # SAFETY: No subprocess/os.system — all responses via decide_response()
-            # `;` / `&&` / `||` lines go to the shared sequencer, which also
-            # resolves any `cd` segment and hands back the resulting cwd.
-            chained = is_chained(line)
+            # `;` / `&&` / `||` / `|` / redirection lines go to the shared line
+            # path, which also resolves any `cd` segment and hands back the cwd.
+            chained = has_shell_syntax(line)
             if chained:
                 response, new_cwd = decide_line(
                     "telnet",
@@ -204,7 +208,12 @@ class TelnetSession:
 
             content = response.content.replace("\n", "\r\n")
             self.transport.write(("\r\n" + content + "\r\n" + self.prompt).encode())
-            self._log(line, response.status, response.response_type, mitre)
+
+            # A redirected write target is intel: record it, never print it.
+            params = {"command": line}
+            if response.redirect:
+                params["redirect"] = response.redirect
+            self._log(line, response.status, response.response_type, mitre, params)
 
     def _log(self, action: str, response_status: str, response_type: str,
              mitre: dict, parameters: dict | None = None) -> None:
