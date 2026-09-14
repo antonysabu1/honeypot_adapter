@@ -144,6 +144,43 @@ check("grep root /etc", "grep: /etc: Is a directory\n", "2")
 check("grep root /nope", "grep: /nope: No such file or directory\n", "2")
 check("grep root /etc/passwd | wc -l", "1\n", "0")
 
+# --- the standalone form and the piped form are the same implementation ---
+# If these ever disagree, one of the two paths has grown its own copy again.
+def check_parity(prefix, path="/etc/passwd"):
+    direct = run(f"{prefix} {path}")[0]
+    piped = run(f"cat {path} | {prefix}")[0]
+    if (direct.content, direct.status) != (piped.content, piped.status):
+        msg = (f"{prefix!r} drifted: direct={direct.content!r}/{direct.status} "
+               f"piped={piped.content!r}/{piped.status}")
+        failures.append(msg)
+        print(f"FAIL {msg}")
+    else:
+        print(f"ok   {prefix!r} agrees with its piped form")
+
+
+for prefix in ("grep root", "grep -c nologin", "grep nomatch", "grep -i ROOT",
+               "head -1", "head -n 2", "tail -2", "sort -r", "sort -u",
+               "uniq", "uniq -c", "cut -d: -f1", "cut -d: -f1,3", "cut -f1"):
+    check_parity(prefix)
+check_parity("head -3", "/root/.bash_history")
+
+# --- flag handling bash agrees with ----------------------------------------
+check("head -1 /etc/passwd", "root:x:0:0:root:/root:/bin/bash\n", "0",
+      label="head honours -1")
+check("tail -1 /etc/passwd",
+      "antony:x:1000:1000:Antony,,,:/home/antony:/bin/bash\n", "0",
+      label="tail honours -1")
+check_parity("cut -d' ' -f1")  # a quoted delimiter is unwrapped, not passed through
+
+# wc is the one form that names its file, so it is not byte-identical to the pipe.
+wc_direct = run("wc -l /etc/passwd")[0]
+wc_piped = run("cat /etc/passwd | wc -l")[0]
+if wc_direct.content != wc_piped.content.rstrip("\n") + " /etc/passwd\n":
+    failures.append(f"wc -l drifted: {wc_direct.content!r} vs {wc_piped.content!r}")
+    print(f"FAIL wc -l drifted: {wc_direct.content!r} vs {wc_piped.content!r}")
+else:
+    print("ok   wc -l agrees with its piped form, plus the filename")
+
 # --- one plain command still takes the single-command path ----------------
 check_pred("id", False)
 check_pred("cat /etc/passwd", False)

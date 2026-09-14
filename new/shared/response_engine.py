@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from shared.filesystem import FakeFilesystem
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
+    FILTERS,
     apply_filter,
     is_devnull,
     parse_segment,
@@ -70,25 +71,29 @@ def _cmd_cat(ctx: _Ctx) -> ResponsePlan | None:
         return ResponsePlan('file_contents', ctx.fs.cat(p), status)
     return None
 
-def _cmd_grep(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'grep':
-        # The pattern is the first operand and the file the one after it.
-        operands = [a for a in ctx.args if a and not a.startswith('-')]
-        if len(operands) < 2:
-            return ResponsePlan('command_not_found', 'grep: missing file operand\n', '127')
-        p = _resolve_path(operands[1], ctx.cwd)
-        if ctx.fs.is_dir(p):
-            return ResponsePlan('command_not_found', f'grep: {p}: Is a directory\n', '2')
-        if not ctx.fs.is_file(p):
-            return ResponsePlan('command_not_found',
-                                f'grep: {p}: No such file or directory\n', '2')
-        # The same matcher the pipeline stage uses, so `grep x f` and
-        # `cat f | grep x` can never disagree. Status 1 means "no match".
-        filtered = apply_filter(ctx.cmd, ctx.fs.cat(p))
-        if filtered is None:
-            return ResponsePlan('command_not_found', 'grep: missing pattern\n', '2')
-        return ResponsePlan('command_output', filtered[0], filtered[1])
-    return None
+# The filter commands, minus `cat`: its standalone form answers as
+# file_contents, which test_response_engine pins. Both this handler and the
+# pipeline stages run apply_filter(), so `grep x f` cannot drift from
+# `cat f | grep x`.
+_VIEW_CMDS = tuple(name for name in FILTERS if name != "cat")
+
+def _cmd_view(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base not in _VIEW_CMDS:
+        return None
+
+    path = _file_operand(ctx.args, ctx.cwd)
+    if path is None:
+        return ResponsePlan('command_not_found',
+                            f'{ctx.base}: missing file operand\n', '127')
+    if not ctx.fs.is_file(path):
+        why = 'Is a directory' if ctx.fs.is_dir(path) else 'No such file or directory'
+        return ResponsePlan('command_not_found', f'{ctx.base}: {path}: {why}\n', '2')
+
+    text, status = apply_filter(ctx.cmd, ctx.fs.cat(path))
+    if ctx.base == 'wc':
+        # bash names the file it counted after the counts.
+        text = text.rstrip('\n') + ' ' + path + '\n'
+    return ResponsePlan('command_output', text, status)
 
 def _cmd_pwd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd == 'pwd':
@@ -101,7 +106,8 @@ def _cmd_whoami(ctx: _Ctx) -> ResponsePlan | None:
     return None
 
 def _cmd_uname(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.cmd == 'uname' or ctx.cmd.startswith('uname '):
+    # ctx.base, not the raw prefix: `uname\t-a` must answer too.
+    if ctx.base == 'uname':
         return ResponsePlan('command_output', 'Linux honeypot 5.15.0-105-generic #115-Ubuntu SMP Mon Apr 15 09:52:04 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux', '0')
     return None
 
@@ -251,96 +257,6 @@ def _cmd_cal(ctx: _Ctx) -> ResponsePlan | None:
         return ResponsePlan('command_output', '', '0')
     return None
 
-def _cmd_uname_dup(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'uname':
-        return ResponsePlan('command_output', 'Linux honeypot 5.15.0-105-generic #115-Ubuntu SMP Mon Apr 15 09:52:04 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux', '0')
-    return None
-
-def _cmd_head(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'head':
-        p = _first_file(ctx.args, ctx.cwd)
-        if p is None:
-            return ResponsePlan('command_not_found', 'head: missing file operand\n', '127')
-        data = ctx.fs.cat(p)
-        lines = data.splitlines() if data else []
-        n = _take_num(ctx.args, 10)
-        lines = lines[:n]
-        return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
-    return None
-
-def _cmd_tail(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'tail':
-        p = _first_file(ctx.args, ctx.cwd)
-        if p is None:
-            return ResponsePlan('command_not_found', 'tail: missing file operand\n', '127')
-        data = ctx.fs.cat(p)
-        lines = data.splitlines() if data else []
-        n = _take_num(ctx.args, 10)
-        lines = lines[-n:] if n else lines
-        return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
-    return None
-
-def _cmd_sort(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'sort':
-        p = _first_file(ctx.args, ctx.cwd)
-        if p is None:
-            return ResponsePlan('command_not_found', 'sort: missing file operand\n', '127')
-        data = ctx.fs.cat(p)
-        lines = data.splitlines() if data else []
-        return ResponsePlan('command_output', '\n'.join(sorted(lines)) + '\n', '0')
-    return None
-
-def _cmd_uniq(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'uniq':
-        p = _first_file(ctx.args, ctx.cwd)
-        if p is None:
-            return ResponsePlan('command_not_found', 'uniq: missing file operand\n', '127')
-        data = ctx.fs.cat(p)
-        lines = data.splitlines() if data else []
-        out = []
-        for line in lines:
-            if not out or line != out[-1]:
-                out.append(line)
-        return ResponsePlan('command_output', '\n'.join(out) + '\n', '0')
-    return None
-
-def _cmd_wc(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'wc':
-        p = _first_file(ctx.args, ctx.cwd)
-        if p is None:
-            return ResponsePlan('command_not_found', 'wc: missing file operand\n', '127')
-        data = ctx.fs.cat(p)
-        lines = data.splitlines() if data else []
-        # bash prints the byte/word counts only when they were asked for.
-        if '-l' in ctx.args:
-            return ResponsePlan('command_output', f'{len(lines)} {p}\n', '0')
-        nbytes = len(data.encode('utf-8'))
-        return ResponsePlan('command_output', f'{len(lines)} {len(data.split())} {nbytes} {p}\n', '0')
-    return None
-
-def _cmd_cut(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'cut':
-        p = _first_file(ctx.args, only_flag=True, cwd=ctx.cwd)
-        if p is None:
-            return ResponsePlan('command_not_found', 'cut: missing file operand\n', '127')
-        delim = ' '
-        fields = '1'
-        for a in ctx.args:
-            if a.startswith('-d') and len(a) > 2:
-                delim = a[2:]
-            elif a == '-d':
-                delim = ctx.args[ctx.args.index(a) + 1]
-            if a.startswith('-f') and len(a) > 2:
-                fields = a[2:]
-            elif a == '-f':
-                fields = ctx.args[ctx.args.index(a) + 1]
-        data = ctx.fs.cat(p)
-        lines = data.splitlines() if data else []
-        idxs = [int(x) - 1 for x in fields.split(',')]
-        out_lines = [':'.join((parts[i] if i < len(parts) else '' for i in idxs)) for parts in (line.split(delim) for line in lines)]
-        return ResponsePlan('command_output', '\n'.join(out_lines) + '\n', '0')
-    return None
-
 def _cmd_dd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'dd':
         return ResponsePlan('command_output', '0+1 records in\n0+1 records out\n', '0')
@@ -348,7 +264,7 @@ def _cmd_dd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_du(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'du':
-        p = _first_file(ctx.args, ctx.cwd)
+        p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'du: missing file operand\n', '127')
         nbytes = len(ctx.fs.cat(p).encode('utf-8')) or 4096
@@ -417,7 +333,7 @@ def _cmd_find(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_file(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'file':
-        p = _first_file(ctx.args, ctx.cwd)
+        p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'file: missing operand\n', '127')
         node = ctx.fs._resolve(p)
@@ -428,7 +344,7 @@ def _cmd_file(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_stat(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'stat':
-        p = _first_file(ctx.args, ctx.cwd)
+        p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'stat: missing file operand\n', '127')
         return ResponsePlan('command_output', f'  File: {p}\n  Size: 4096\t\tBlocks: 8\t\tIO Block: 4096\n  Device: 20357h/132109d\n  Inode: 12856505\n  Links: 1\n  Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)\n  Access: 2026-09-08 12:00:01.000000000 +0000\n  Modify: 2026-09-08 10:42:13.000000000 +0000\n  Change: 2026-09-08 10:42:13.000000000 +0000\n  Birth: 2026-09-08 10:42:13.000000000 +0000\n', '0')
@@ -485,7 +401,7 @@ def _cmd_which(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_strings(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'strings':
-        p = _first_file(ctx.args, ctx.cwd)
+        p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'strings: missing file operand\n', '127')
         return ResponsePlan('command_output', 'ELF\n', '0')
@@ -493,7 +409,7 @@ def _cmd_strings(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_base64(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'base64':
-        p = _first_file(ctx.args, ctx.cwd)
+        p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', "base64: invalid option -- 'd'\n", '127')
         return ResponsePlan('command_output', 'REPLACE_BASE64\n', '0')
@@ -602,7 +518,7 @@ def _cmd_ssh(ctx: _Ctx) -> ResponsePlan | None:
 _ROUTES: tuple = (
     _cmd_ls,
     _cmd_cat,
-    _cmd_grep,
+    _cmd_view,
     _cmd_pwd,
     _cmd_whoami,
     _cmd_uname,
@@ -630,13 +546,6 @@ _ROUTES: tuple = (
     _cmd_rm,
     _cmd_tee,
     _cmd_cal,
-    _cmd_uname_dup,
-    _cmd_head,
-    _cmd_tail,
-    _cmd_sort,
-    _cmd_uniq,
-    _cmd_wc,
-    _cmd_cut,
     _cmd_dd,
     _cmd_du,
     _cmd_lscpu,
@@ -719,20 +628,14 @@ def _resolve_path(path: str, cwd: str) -> str:
         return path
     return cwd.rstrip("/") + "/" + path
 
-def _first_file(args: list, cwd: str = "/", only_flag: bool = False) -> str | None:
-    skip_next = False
-    for a in args:
-        if skip_next:
-            skip_next = False
-            continue
-        if a.startswith("-") or not a:
-            # Flags that consume a following value (e.g. head -n 2 file)
-            # should not let that value be mistaken for a path.
-            if a in ("-n", "-d", "-f", "-c"):
-                skip_next = True
-            continue
-        return _resolve_path(a, cwd)
-    return None
+def _file_operand(args: list, cwd: str = "/") -> str | None:
+    """The file the command was pointed at.
+
+    Last, not first: every command using this takes its path after its flags,
+    so `head -n 2 f`, `uniq -c f` and `cut -d: -f1 f` all end with the path.
+    """
+    operands = [a for a in args if a and not a.startswith("-")]
+    return _resolve_path(operands[-1], cwd) if operands else None
 
 # ---------------------------------------------------------------------------
 # Shell command lines: `;`, `&&` and `||` sequencing
@@ -967,19 +870,4 @@ def decide_line(
         status,
         redirect=",".join(redirects) if redirects else None,
     ), cwd
-
-
-def _take_num(args: list, default: int) -> int:
-    for i, a in enumerate(args):
-        if a.startswith("-n") and len(a) > 2:
-            try:
-                return int(a[2:])
-            except ValueError:
-                return default
-        if a == "-n" and i + 1 < len(args):
-            try:
-                return int(args[i + 1])
-            except ValueError:
-                return default
-    return default
 

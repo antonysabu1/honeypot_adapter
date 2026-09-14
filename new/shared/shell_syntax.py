@@ -49,10 +49,6 @@ class Redirect:
     def hides_stdout(self) -> bool:
         return self.stdout_target is not None
 
-    @property
-    def hides_stderr(self) -> bool:
-        return self.stderr_target is not None or self.stderr_to_stdout
-
     def targets(self) -> list[str]:
         """Every path this segment pointed I/O at, for intel.
 
@@ -136,9 +132,7 @@ def parse_segment(segment: str) -> tuple[list[str], Redirect]:
         else:
             pending = op
 
-    if pending is not None:  # trailing operator with no target: ignore it
-        pass
-
+    # A trailing operator with no target (`id >`) is simply dropped.
     stage_list = [" ".join(stage) for stage in stages if stage]
     head = stage_list[0].split()[0] if stage_list else ""
     if red.stdin_target and head in FILTERS:
@@ -220,7 +214,7 @@ def apply_filter(stage: str, text: str) -> tuple[str, str] | None:
     Status is the filter's own exit status, so `grep missing` reports 1 the way
     grep does.
     """
-    parts = stage.split()
+    parts = _split_tokens(stage)
     if not parts:
         return None
     name, args = parts[0], parts[1:]
@@ -237,7 +231,7 @@ def apply_filter(stage: str, text: str) -> tuple[str, str] | None:
         if pattern is None:
             return "", "2"
         try:
-            rx = re.compile(pattern.strip("\"'"), re.IGNORECASE if "-i" in args else 0)
+            rx = re.compile(_unquote(pattern), re.IGNORECASE if "-i" in args else 0)
         except re.error:
             return "", "2"
         invert = "-v" in args
@@ -286,13 +280,15 @@ def apply_filter(stage: str, text: str) -> tuple[str, str] | None:
         fields = "1"
         for i, a in enumerate(args):
             if a.startswith("-d") and len(a) > 2:
-                delim = a[2:]
+                delim = _unquote(a[2:])
             elif a == "-d" and i + 1 < len(args):
-                delim = args[i + 1]
+                delim = _unquote(args[i + 1])
             elif a.startswith("-f") and len(a) > 2:
-                fields = a[2:]
+                fields = _unquote(a[2:])
             elif a == "-f" and i + 1 < len(args):
-                fields = args[i + 1]
+                fields = _unquote(args[i + 1])
+        if len(delim) != 1:
+            return "cut: the delimiter must be a single character\n", "1"
         idxs = [int(x) - 1 for x in fields.split(",") if x.strip().isdigit()]
         out = [
             delim.join(parts[i] if i < len(parts) else "" for i in idxs)
@@ -303,10 +299,19 @@ def apply_filter(stage: str, text: str) -> tuple[str, str] | None:
     if name == "wc":
         if "-l" in args:
             return f"{len(lines)}\n", "0"
-        words = len(text.split())
-        return f"{len(lines)} {words} {len(text.encode('utf-8'))}\n", "0"
+        if "-w" in args:
+            return f"{len(text.split())}\n", "0"
+        if "-c" in args:
+            return f"{len(text.encode('utf-8'))}\n", "0"
+        return (f"{len(lines)} {len(text.split())} "
+                f"{len(text.encode('utf-8'))}\n"), "0"
 
     return None
+
+
+def _unquote(token: str) -> str:
+    """Drop the surrounding quotes a user typed: `-d' '` -> `-d `."""
+    return token.strip("\"'")
 
 
 def _int(value: str, default: int) -> int:

@@ -34,7 +34,7 @@ only what is genuinely protocol-specific.
 |---|---|
 | `shared/response_engine.py` | One handler per command in `_ROUTES` (tried in order), plus `decide_line()` for `;` / `&&` / `||` lines |
 | `shared/shell.py` | Banner, prompt, argument split, keystroke handling (`LineEditor`), `cd` policy (`resolve_cd`) |
-| `shared/shell_syntax.py` | Pipelines and redirections (`>`, `>>`, `2>`, `2>&1`, `&>`, `<`, `/dev/null`): parsing, filter stages, which stream is hidden. Pure — it knows no commands, so the engine still runs every stage |
+| `shared/shell_syntax.py` | Pipelines and redirections (`>`, `>>`, `2>`, `2>&1`, `&>`, `<`, `/dev/null`): parsing, filter stages, which stream is hidden. Pure — it knows no commands, so the engine still runs every stage. The engine's `grep`/`head`/`tail`/`cut`/`sort`/`uniq`/`wc` handlers call these same filters |
 | `shared/events.py` | The single telemetry event builder |
 | `shared/filesystem.py` | The fake filesystem (single owner of simulated file state) |
 | `shared/mitre.py`, `shared/logger.py`, `shared/session.py` | Detection tagging, JSONL logging, session tracker |
