@@ -658,6 +658,149 @@ def _first_file(args: list, cwd: str = "/", only_flag: bool = False) -> str | No
     return None
 
 
+# ---------------------------------------------------------------------------
+# Shell command lines: `;`, `&&` and `||` sequencing
+#
+# decide_response() answers ONE command. decide_line() answers a whole line the
+# way a shell does, so an attacker's first reflex (`id; uname -a`, or
+# `cat /etc/passwd && curl ...`) is not answered with "command not found".
+#
+# The session's cwd is owned by the transport shell that holds the session; the
+# sequencer only tracks it for the duration of the line and hands the resulting
+# value back so the transport can persist it.
+# ---------------------------------------------------------------------------
+
+
+def _tokenize(line: str) -> list[tuple[str, str]]:
+    """Split a command line into (connector, segment) pairs.
+
+    Connectors are `;`, `&&` and `||`; the first segment is tagged `;`. Empty
+    segments are preserved so callers can tell `id;` (a real line) from `id`.
+    Separators inside single/double quotes and behind a backslash are literal.
+    """
+    tokens: list[tuple[str, str]] = []
+    buf: list[str] = []
+    connector = ";"
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(line):
+            buf.append(ch)
+            buf.append(line[i + 1])
+            i += 2
+            continue
+        two = line[i:i + 2]
+        if two in ("&&", "||"):
+            tokens.append((connector, "".join(buf).strip()))
+            buf = []
+            connector = two
+            i += 2
+            continue
+        if ch == ";":
+            tokens.append((connector, "".join(buf).strip()))
+            buf = []
+            connector = ";"
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tokens.append((connector, "".join(buf).strip()))
+    return tokens
+
+
+def is_chained(line: str) -> bool:
+    """True when the line carries shell sequencing rather than one command."""
+    return len(_tokenize(line)) > 1
+
+
+def _run_segment(
+    segment: str,
+    cwd: str,
+    fs: FakeFilesystem,
+    protocol: str,
+    session_id: str,
+    username: str,
+) -> tuple[ResponsePlan, str]:
+    """Run one `;`-separated segment, resolving `cd` against the fake FS."""
+    if segment == "cd" or segment.startswith("cd "):
+        target = segment[2:].strip() or "/root"
+        joined = target if target.startswith("/") else os.path.join(cwd, target)
+        normalized = os.path.normpath(joined)
+        if not fs.exists(normalized):
+            return ResponsePlan(
+                "cd_failed", f"bash: cd: {joined}: No such file or directory", "1"
+            ), cwd
+        if not fs.is_dir(normalized):
+            return ResponsePlan("cd_failed", f"bash: cd: {joined}: Not a directory", "1"), cwd
+        return ResponsePlan("command_output", "", "0"), normalized
+
+    args = segment.split()[1:]
+    plan = decide_response(
+        protocol,
+        session_id,
+        segment,
+        {"args": args, "cwd": cwd},
+        fs,
+        username=username,
+    )
+    return plan, cwd
+
+
+def decide_line(
+    protocol: str,
+    session_id: str,
+    action: str,
+    parameters: dict,
+    fs: FakeFilesystem,
+    username: str = "root",
+) -> tuple[ResponsePlan, str]:
+    """Answer a full command line; returns (plan, resulting cwd).
+
+    `;` always continues, `&&` continues only after a zero status, `||` only
+    after a non-zero one. The exit status is that of the last segment actually
+    executed, and output is the concatenation of every segment that ran.
+    """
+    cwd = parameters.get("cwd", "/")
+    tokens = _tokenize(action)
+    if len(tokens) <= 1:
+        return decide_response(
+            protocol, session_id, action, parameters, fs, username=username
+        ), cwd
+
+    output: list[str] = []
+    status = "0"
+    response_type = "command_output"
+    for connector, segment in tokens:
+        if not segment:
+            continue
+        if connector == "&&" and status != "0":
+            continue
+        if connector == "||" and status == "0":
+            continue
+
+        plan, cwd = _run_segment(segment, cwd, fs, protocol, session_id, username)
+        status = plan.status
+        response_type = plan.response_type
+        if plan.response_type == "session_end":
+            return ResponsePlan("session_end", plan.content, plan.status), cwd
+        if plan.content:
+            output.append(plan.content.rstrip("\n"))
+
+    return ResponsePlan(response_type, "\n".join(output), status), cwd
+
+
 def _take_num(args: list, default: int) -> int:
     for i, a in enumerate(args):
         if a.startswith("-n") and len(a) > 2:

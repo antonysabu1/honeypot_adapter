@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from shared.logger import log_event
-from shared.response_engine import decide_response
+from shared.response_engine import decide_line, decide_response, is_chained
 from shared.filesystem import FakeFilesystem
 from shared.mitre import mitre_analyze
 
@@ -178,14 +178,32 @@ class TelnetSession:
             )
 
             # SAFETY: No subprocess/os.system — all responses via decide_response()
-            response = decide_response(
-                "telnet",
-                self.session_id,
-                line,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username or "root",
-            )
+            # `;` / `&&` / `||` lines go to the shared sequencer, which also
+            # resolves any `cd` segment and hands back the resulting cwd.
+            chained = is_chained(line)
+            if chained:
+                response, new_cwd = decide_line(
+                    "telnet",
+                    self.session_id,
+                    line,
+                    {"args": args, "cwd": self.current_dir},
+                    self.fs,
+                    username=self.username or "root",
+                )
+                if new_cwd != self.current_dir:
+                    self.current_dir = new_cwd
+                    self.prompt = (
+                        f"root@honeypot:{self._shorten_path(self.current_dir)}# "
+                    )
+            else:
+                response = decide_response(
+                    "telnet",
+                    self.session_id,
+                    line,
+                    {"args": args, "cwd": self.current_dir},
+                    self.fs,
+                    username=self.username or "root",
+                )
 
             if response.response_type == "session_end":
                 self.transport.write(b"\r\nlogout\r\n")
@@ -212,7 +230,7 @@ class TelnetSession:
             cmd = line
             if cmd.strip() == "cd":
                 cmd = "cd /root"
-            if cmd.startswith("cd "):
+            if not chained and cmd.startswith("cd "):
                 path = cmd[3:].strip()
                 if not path:
                     path = "/root"

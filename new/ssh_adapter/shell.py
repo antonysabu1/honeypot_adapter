@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from shared.logger import log_event
-from shared.response_engine import decide_response
+from shared.response_engine import decide_line, decide_response, is_chained
 from shared.filesystem import FakeFilesystem
 from shared.mitre import mitre_analyze
 
@@ -114,14 +114,30 @@ class FakeSSHShell:
         # non-path operands (e.g. `which bash`, `date +%Y`, `find -name ...`)
         # are not corrupted by cwd-joining.
 
-        response = decide_response(
-            "ssh",
-            self.session_id,
-            cmd,
-            {"args": args, "cwd": self.current_dir},
-            self.fs,
-            username=self.username,
-        )
+        # `;` / `&&` / `||` lines go to the shared sequencer, which also resolves
+        # any `cd` segment and hands back the resulting cwd.
+        chained = is_chained(cmd)
+        if chained:
+            response, new_cwd = decide_line(
+                "ssh",
+                self.session_id,
+                cmd,
+                {"args": args, "cwd": self.current_dir},
+                self.fs,
+                username=self.username,
+            )
+            if new_cwd != self.current_dir:
+                self.current_dir = new_cwd
+                self._update_prompt()
+        else:
+            response = decide_response(
+                "ssh",
+                self.session_id,
+                cmd,
+                {"args": args, "cwd": self.current_dir},
+                self.fs,
+                username=self.username,
+            )
 
         if response.response_type == "session_end":
             self.channel.send("\r\nlogout\r\n".encode())
@@ -144,7 +160,7 @@ class FakeSSHShell:
             self._closed = True
             return
 
-        if cmd.startswith("cd "):
+        if not chained and cmd.startswith("cd "):
             path = cmd[3:].strip()
             if not path:
                 path = "/root"
