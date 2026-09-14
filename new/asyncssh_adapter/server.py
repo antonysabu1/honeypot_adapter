@@ -13,8 +13,8 @@ from pathlib import Path
 
 import asyncssh
 
-from asyncssh_adapter.events import build_event
 from asyncssh_adapter.shell import AsyncSSHShell
+from shared.events import build_event
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
 
