@@ -22,8 +22,12 @@ async def _listen(name: str, start) -> bool:
 
 
 def run_paramiko_ssh():
-    import ssh_adapter.server as ssh_server
-    ssh_server.start_server()
+    """Start the Paramiko listener; a bind failure must not print a traceback."""
+    try:
+        import ssh_adapter.server as ssh_server
+        ssh_server.start_server()
+    except Exception as exc:  # noqa: BLE001 - telnet must survive this thread dying
+        print(f"  SSH/paramiko listener failed: {exc!r}")
 
 
 async def run_telnet_and_asyncssh():
