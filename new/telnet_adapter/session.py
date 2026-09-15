@@ -1,11 +1,18 @@
-import os
-import uuid
-from datetime import datetime, timezone
-
-from shared.logger import log_event
-from shared.response_engine import decide_response
+from shared.events import build_event
 from shared.filesystem import FakeFilesystem
+from shared.logger import log_event
 from shared.mitre import mitre_analyze
+from shared.response_engine import (
+    decide_line,
+    decide_response,
+    has_shell_syntax,
+)
+from shared.shell import (
+    POST_LOGIN_BANNER,
+    parse_args,
+    prompt_for,
+    resolve_cd,
+)
 
 
 class TelnetSession:
@@ -20,7 +27,7 @@ class TelnetSession:
         self.username = ""
         self.password = ""
         self.current_dir = "/root"
-        self.prompt = "root@honeypot:~# "
+        self.prompt = prompt_for(self.current_dir)
         self.buffer = b""
         self._iac_buf = b""  # leftover bytes of a partial IAC sequence
         self._sb_mode = False  # inside an IAC SB ... IAC SE subnegotiation
@@ -110,42 +117,26 @@ class TelnetSession:
             self.state = "password"
         elif self.state == "password":
             self.password = line
-            log_event(
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "protocol": "telnet",
-                    "source_ip": self.source_ip,
-                    "session_id": self.session_id,
-                    "action": "login_attempt",
-                    "parameters": {
-                        "username": self.username,
-                        "password": self.password,
-                    },
-                    "raw_metadata": {},
-                    "session_source": "protocol_native",
-                    "response_status": "authenticated",
-                    "response_type": "fake_auth_success",
+            log_event(build_event(
+                session_id=self.session_id,
+                source_ip=self.source_ip,
+                protocol="telnet",
+                action="login_attempt",
+                parameters={
+                    "username": self.username,
+                    "password": self.password,
+                },
+                response_status="authenticated",
+                response_type="fake_auth_success",
+                # A telnet login always "succeeds", so it is scored directly.
+                mitre={
                     "mitre_attack_id": "T1078",
                     "mitre_technique_name": "Valid Accounts",
                     "mitre_tactic": "Initial Access",
-                    "mitre_attack_id_secondary": None,
-                    "mitre_technique_name_secondary": None,
                     "mitre_confidence": "high",
-                }
-            )
-            motd = (
-                "\r\n"
-                "Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-105-generic x86_64)\r\n"
-                "\r\n"
-                " * Documentation:  https://help.ubuntu.com\r\n"
-                " * Management:     https://landscape.canonical.com\r\n"
-                " * Support:        https://ubuntu.com/advantage\r\n"
-                "\r\n"
-                "Last login: Mon Sep  8 10:42:13 2026 from 192.168.1.100\r\n"
-                "\r\n"
-            )
-            self.transport.write(motd.encode())
+                },
+            ))
+            self.transport.write(POST_LOGIN_BANNER.encode())
             self.transport.write(self.prompt.encode())
             self.state = "shell"
         elif self.state == "shell":
@@ -156,154 +147,84 @@ class TelnetSession:
             # via _resolve_path; args are passed through untouched so flags and
             # non-path operands (e.g. `which bash`, `date +%Y`, `find -name ...`)
             # are not corrupted by cwd-joining.
-            args = line.split()[1:] if len(line.split()) > 1 else []
+            args = parse_args(line)
 
             mitre = mitre_analyze(line)
 
-            log_event(
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "protocol": "telnet",
-                    "source_ip": self.source_ip,
-                    "session_id": self.session_id,
-                    "action": line,
-                    "parameters": {"command": line},
-                    "raw_metadata": {},
-                    "session_source": "protocol_native",
-                    "response_status": "0",
-                    "response_type": "pending",
-                    **mitre,
-                }
-            )
+            self._log(line, "0", "pending", mitre)
 
             # SAFETY: No subprocess/os.system — all responses via decide_response()
-            response = decide_response(
-                "telnet",
-                self.session_id,
-                line,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username or "root",
-            )
+            # `;` / `&&` / `||` / `|` / redirection lines go to the shared line
+            # path, which also resolves any `cd` segment and hands back the cwd.
+            chained = has_shell_syntax(line)
+            if chained:
+                response, new_cwd = decide_line(
+                    "telnet",
+                    self.session_id,
+                    line,
+                    {"args": args, "cwd": self.current_dir},
+                    self.fs,
+                    username=self.username or "root",
+                )
+                if new_cwd != self.current_dir:
+                    self.current_dir = new_cwd
+                    self.prompt = prompt_for(self.current_dir)
+            else:
+                response = decide_response(
+                    "telnet",
+                    self.session_id,
+                    line,
+                    {"args": args, "cwd": self.current_dir},
+                    self.fs,
+                    username=self.username or "root",
+                )
 
             if response.response_type == "session_end":
                 self.transport.write(b"\r\nlogout\r\n")
-                log_event(
-                    {
-                        "event_id": str(uuid.uuid4()),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "protocol": "telnet",
-                        "source_ip": self.source_ip,
-                        "session_id": self.session_id,
-                        "action": line,
-                        "parameters": {"command": line},
-                        "raw_metadata": {},
-                        "session_source": "protocol_native",
-                        "response_status": "0",
-                        "response_type": "session_end",
-                        **mitre,
-                    }
-                )
+                self._log(line, "0", "session_end", mitre)
                 self.transport.close()
                 return
 
-            # Handle cd locally (same logic as SSH shell)
+            # cd (shared policy; telnet keeps its own sink and logging)
             cmd = line
             if cmd.strip() == "cd":
                 cmd = "cd /root"
-            if cmd.startswith("cd "):
-                path = cmd[3:].strip()
-                if not path:
-                    path = "/root"
-                elif not path.startswith("/"):
-                    path = os.path.join(self.current_dir, path)
-                normalized = os.path.normpath(path)
-                if not self.fs.exists(normalized):
-                    error = f"bash: cd: {path}: No such file or directory"
+            if not chained and cmd.startswith("cd "):
+                cd = resolve_cd(cmd[3:].strip(), self.current_dir, self.fs)
+                if not cd.ok:
                     self.transport.write(
-                        ("\r\n" + error + "\r\n" + self.prompt).encode()
+                        ("\r\n" + cd.error + "\r\n" + self.prompt).encode()
                     )
-                    log_event(
-                        {
-                            "event_id": str(uuid.uuid4()),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "protocol": "telnet",
-                            "source_ip": self.source_ip,
-                            "session_id": self.session_id,
-                            "action": line,
-                            "parameters": {"command": line, "target": path},
-                            "raw_metadata": {},
-                            "session_source": "protocol_native",
-                            "response_status": "1",
-                            "response_type": "cd_failed",
-                            **mitre,
-                        }
+                    self._log(
+                        line, "1", "cd_failed", mitre,
+                        {"command": line, "target": cd.path},
                     )
                     return
-                if not self.fs.is_dir(normalized):
-                    error = f"bash: cd: {path}: Not a directory"
-                    self.transport.write(
-                        ("\r\n" + error + "\r\n" + self.prompt).encode()
-                    )
-                    log_event(
-                        {
-                            "event_id": str(uuid.uuid4()),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "protocol": "telnet",
-                            "source_ip": self.source_ip,
-                            "session_id": self.session_id,
-                            "action": line,
-                            "parameters": {"command": line, "target": path},
-                            "raw_metadata": {},
-                            "session_source": "protocol_native",
-                            "response_status": "1",
-                            "response_type": "cd_failed",
-                            **mitre,
-                        }
-                    )
-                    return
-                self.current_dir = normalized
-                self.prompt = (
-                    f"root@honeypot:{self._shorten_path(self.current_dir)}# "
-                )
+                self.current_dir = cd.cwd
+                self.prompt = prompt_for(self.current_dir)
                 self.transport.write(("\r\n" + self.prompt).encode())
-                log_event(
-                    {
-                        "event_id": str(uuid.uuid4()),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "protocol": "telnet",
-                        "source_ip": self.source_ip,
-                        "session_id": self.session_id,
-                        "action": line,
-                        "parameters": {"command": line},
-                        "raw_metadata": {},
-                        "session_source": "protocol_native",
-                        "response_status": "0",
-                        "response_type": "command_output",
-                        **mitre,
-                    }
-                )
+                self._log(line, "0", "command_output", mitre)
                 return
 
             content = response.content.replace("\n", "\r\n")
             self.transport.write(("\r\n" + content + "\r\n" + self.prompt).encode())
-            log_event(
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "protocol": "telnet",
-                    "source_ip": self.source_ip,
-                    "session_id": self.session_id,
-                    "action": line,
-                    "parameters": {"command": line},
-                    "raw_metadata": {},
-                    "session_source": "protocol_native",
-                    "response_status": response.status,
-                    "response_type": response.response_type,
-                    **mitre,
-                }
-            )
 
-    def _shorten_path(self, path: str) -> str:
-        return path.replace("/root", "~")
+            # A redirected write target is intel: record it, never print it.
+            params = {"command": line}
+            if response.redirect:
+                params["redirect"] = response.redirect
+            self._log(line, response.status, response.response_type, mitre, params)
+
+    def _log(self, action: str, response_status: str, response_type: str,
+             mitre: dict, parameters: dict | None = None) -> None:
+        """Emit one telnet event through the canonical shared builder."""
+        log_event(build_event(
+            session_id=self.session_id,
+            source_ip=self.source_ip,
+            protocol="telnet",
+            action=action,
+            parameters=parameters if parameters is not None else {"command": action},
+            response_status=response_status,
+            response_type=response_type,
+            mitre=mitre,
+        ))
