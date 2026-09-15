@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from datetime import datetime, timezone
 
-from shared.filesystem import FakeFilesystem
+from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
     FILTERS,
@@ -47,14 +47,28 @@ def _cmd_ls(ctx: _Ctx) -> ResponsePlan | None:
     # exact base, so lscpu/lsblk/lsof fall through to their own handlers
     if ctx.base == 'ls':
         path_args = [a for a in ctx.args if not a.startswith('-')]
-        show_all = any(('a' in a for a in ctx.args if a.startswith('-')))
+        flags = ''.join(a[1:] for a in ctx.args if a.startswith('-') and len(a) > 1)
+        show_all = 'a' in flags
+        long_fmt = 'l' in flags
         path = _resolve_path(path_args[0], ctx.cwd) if path_args else ctx.cwd
-        # bash complains instead of silently printing nothing, and exits 2.
         if not ctx.fs.exists(path):
             return ResponsePlan('command_not_found',
                                 f"ls: cannot access '{path}': No such file or directory\n", '2')
         if ctx.fs.is_file(path):
+            if long_fmt:
+                return ResponsePlan('directory_listing', ctx.fs.ls_long_single(path) + '\n', '0')
             return ResponsePlan('directory_listing', path + '\n', '0')
+        if long_fmt:
+            entries = ctx.fs.ls(path) or []
+            if not show_all:
+                entries = [e for e in entries if not e.startswith('.')]
+            if not entries:
+                return ResponsePlan('directory_listing', '', '0')
+            lines = [f"total {len(entries)}"]
+            for name in entries:
+                child_path = path.rstrip('/') + '/' + name
+                lines.append(ctx.fs.ls_long_single(child_path))
+            return ResponsePlan('directory_listing', '\n'.join(lines) + '\n', '0')
         contents = ctx.fs.ls(path) or []
         if not show_all:
             contents = [c for c in contents if not c.startswith('.')]
@@ -234,18 +248,87 @@ def _cmd_dirname(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_touch(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'touch':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'touch: missing file operand\n', '1')
+        for arg in ctx.args:
+            if arg.startswith('-'):
+                continue
+            p = _resolve_path(arg, ctx.cwd)
+            ctx.fs.touch(p)
         return ResponsePlan('command_output', '', '0')
     return None
 
 def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'mkdir':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'mkdir: missing operand\n', '1')
+        parents = any(a == '-p' for a in ctx.args)
+        targets = [a for a in ctx.args if not a.startswith('-')]
+        for arg in targets:
+            p = _resolve_path(arg, ctx.cwd)
+            if parents:
+                _mkdir_p(ctx.fs, p)
+            else:
+                parent = '/'.join(p.rstrip('/').split('/')[:-1]) or '/'
+                if ctx.fs.exists(p):
+                    if not ctx.fs.is_dir(p):
+                        return ResponsePlan('command_not_found',
+                                            f"mkdir: cannot create directory '{arg}': Not a directory\n", '1')
+                    continue
+                if not ctx.fs.exists(parent):
+                    return ResponsePlan('command_not_found',
+                                        f"mkdir: cannot create directory '{arg}': No such file or directory\n", '1')
+                ctx.fs.mkdir(p)
         return ResponsePlan('command_output', '', '0')
     return None
 
+
+def _mkdir_p(fs: FakeFilesystem, path: str) -> None:
+    parts = fs._split(path)
+    current = '/'
+    for part in parts:
+        child = current.rstrip('/') + '/' + part
+        if not fs.exists(child):
+            fs.mkdir(child)
+        current = child
+
 def _cmd_rm(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'rm':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'rm: missing operand\n', '1')
+        force = 'f' in ''.join(a[1:] for a in ctx.args if a.startswith('-') and len(a) > 1)
+        recursive = 'r' in ''.join(a[1:] for a in ctx.args if a.startswith('-') and len(a) > 1)
+        targets = [a for a in ctx.args if not a.startswith('-')]
+        for arg in targets:
+            p = _resolve_path(arg, ctx.cwd)
+            if not ctx.fs.exists(p):
+                if not force:
+                    return ResponsePlan('command_not_found',
+                                        f"rm: cannot remove '{arg}': No such file or directory\n", '1')
+                continue
+            if ctx.fs.is_dir(p):
+                if recursive:
+                    _rm_rf(ctx.fs, p)
+                else:
+                    return ResponsePlan('command_not_found',
+                                        f"rm: cannot remove '{arg}': Is a directory\n", '1')
+            else:
+                ctx.fs.rm(p)
         return ResponsePlan('command_output', '', '0')
     return None
+
+
+def _rm_rf(fs: FakeFilesystem, path: str) -> None:
+    if path == '/':
+        return
+    node = fs._resolve(path)
+    if node is None or not node.is_dir:
+        fs.rm(path)
+        return
+    for name in list(node.children.keys()):
+        child = path.rstrip('/') + '/' + name
+        _rm_rf(fs, child)
+    fs.rmdir(path)
 
 def _cmd_tee(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'tee':
@@ -315,19 +398,18 @@ def _cmd_find(ctx: _Ctx) -> ResponsePlan | None:
             if a in ('-name', '-iname') and i + 1 < len(ctx.args):
                 name = ctx.args[i + 1].strip('"').strip("'")
             elif not a.startswith('-') and (not start_given):
-                start = a
+                start = _resolve_path(a, ctx.cwd)
                 start_given = True
-        results = []
+        results: list[str] = []
         if name:
             dirs_to_search = [start] if ctx.fs.is_dir(start) else []
-            for d in ['/root', '/home/admin', '/home/antony']:
+            for d in ['/root', '/home/admin', '/home/antony', '/home/user']:
                 if d != start and ctx.fs.is_dir(d):
                     dirs_to_search.append(d)
             for d in dirs_to_search:
-                if ctx.fs.ls(d):
-                    for f in ctx.fs.ls(d):
-                        if f == name:
-                            results.append(f'{d}/{f}')
+                for entry in ctx.fs.ls(d):
+                    if entry == name:
+                        results.append(f'{d.rstrip("/")}/{entry}')
         return ResponsePlan('command_output', '\n'.join(results) + '\n', '0')
     return None
 
@@ -347,7 +429,10 @@ def _cmd_stat(ctx: _Ctx) -> ResponsePlan | None:
         p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'stat: missing file operand\n', '127')
-        return ResponsePlan('command_output', f'  File: {p}\n  Size: 4096\t\tBlocks: 8\t\tIO Block: 4096\n  Device: 20357h/132109d\n  Inode: 12856505\n  Links: 1\n  Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)\n  Access: 2026-09-08 12:00:01.000000000 +0000\n  Modify: 2026-09-08 10:42:13.000000000 +0000\n  Change: 2026-09-08 10:42:13.000000000 +0000\n  Birth: 2026-09-08 10:42:13.000000000 +0000\n', '0')
+        if not ctx.fs.exists(p):
+            return ResponsePlan('command_not_found',
+                                f"stat: cannot stat '{p}': No such file or directory\n", '1')
+        return ResponsePlan('command_output', ctx.fs.stat(p), '0')
     return None
 
 def _cmd_mount(ctx: _Ctx) -> ResponsePlan | None:
@@ -357,21 +442,112 @@ def _cmd_mount(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_chmod(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'chmod':
+        if len(ctx.args) < 2:
+            return ResponsePlan('command_not_found', 'chmod: missing operand\n', '1')
+        mode_str = ctx.args[0]
+        targets = [a for a in ctx.args[1:] if not a.startswith('-')]
+        try:
+            mode = int(mode_str, 8)
+        except ValueError:
+            return ResponsePlan('command_not_found',
+                                f"chmod: invalid mode: '{mode_str}'\n", '1')
+        for arg in targets:
+            p = _resolve_path(arg, ctx.cwd)
+            if not ctx.fs.exists(p):
+                return ResponsePlan('command_not_found',
+                                    f"chmod: cannot access '{arg}': No such file or directory\n", '1')
+            ctx.fs.chmod(p, mode)
         return ResponsePlan('command_output', '', '0')
     return None
 
 def _cmd_chown(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'chown':
+        if len(ctx.args) < 2:
+            return ResponsePlan('command_not_found', 'chown: missing operand\n', '1')
+        spec = ctx.args[0]
+        targets = [a for a in ctx.args[1:] if not a.startswith('-')]
+        uid, gid = _parse_chown_spec(spec, ctx.fs)
+        for arg in targets:
+            p = _resolve_path(arg, ctx.cwd)
+            if not ctx.fs.exists(p):
+                return ResponsePlan('command_not_found',
+                                    f"chown: cannot access '{arg}': No such file or directory\n", '1')
+            ctx.fs.chown(p, uid=uid, gid=gid)
         return ResponsePlan('command_output', '', '0')
     return None
 
+
+def _parse_chown_spec(spec: str, fs: FakeFilesystem) -> tuple[int | None, int | None]:
+    uid: int | None = None
+    gid: int | None = None
+    if ":" in spec:
+        u_part, g_part = spec.split(":", 1)
+        if u_part:
+            uid = _resolve_uid(u_part, fs)
+        if g_part:
+            gid = _resolve_gid(g_part, fs)
+    else:
+        uid = _resolve_uid(spec, fs)
+    return uid, gid
+
+
+def _resolve_uid(val: str, fs: FakeFilesystem) -> int | None:
+    try:
+        return int(val)
+    except ValueError:
+        return fs.users.uid(val)
+
+
+def _resolve_gid(val: str, fs: FakeFilesystem) -> int | None:
+    try:
+        return int(val)
+    except ValueError:
+        return fs.groups.gid(val)
+
 def _cmd_ln(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'ln':
+        if len(ctx.args) < 2:
+            return ResponsePlan('command_not_found', 'ln: missing file operand\n', '1')
+        symlink = '-s' in ctx.args
+        args = [a for a in ctx.args if not a.startswith('-')]
+        src, dst = args[0], args[1]
+        src_p = _resolve_path(src, ctx.cwd)
+        dst_p = _resolve_path(dst, ctx.cwd)
+        if not ctx.fs.exists(src_p):
+            return ResponsePlan('command_not_found',
+                                f"ln: failed to access '{src}': No such file or directory\n", '1')
+        if ctx.fs.is_dir(src_p):
+            return ResponsePlan('command_not_found',
+                                f"ln: failed to access '{src}': Is a directory\n", '1')
+        if ctx.fs.is_dir(dst_p):
+            dst_p = dst_p.rstrip('/') + '/' + src.rsplit('/', 1)[-1]
+        if symlink:
+            src_content = ctx.fs.read_content(src_p) or ""
+            ctx.fs.write_file(dst_p, f"symlink:{src_p}")
+        else:
+            content = ctx.fs.read_content(src_p) or ""
+            ctx.fs.write_file(dst_p, content)
         return ResponsePlan('command_output', '', '0')
     return None
 
 def _cmd_rmdir(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'rmdir':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'rmdir: missing operand\n', '1')
+        for arg in ctx.args:
+            if arg.startswith('-'):
+                continue
+            p = _resolve_path(arg, ctx.cwd)
+            if not ctx.fs.exists(p):
+                return ResponsePlan('command_not_found',
+                                    f"rmdir: failed to remove '{arg}': No such file or directory\n", '1')
+            if not ctx.fs.is_dir(p):
+                return ResponsePlan('command_not_found',
+                                    f"rmdir: failed to remove '{arg}': Not a directory\n", '1')
+            if ctx.fs.ls(p):
+                return ResponsePlan('command_not_found',
+                                    f"rmdir: failed to remove '{arg}': Directory not empty\n", '1')
+            ctx.fs.rmdir(p)
         return ResponsePlan('command_output', '', '0')
     return None
 
@@ -515,6 +691,144 @@ def _cmd_ssh(ctx: _Ctx) -> ResponsePlan | None:
         return ResponsePlan('command_not_found', f'bash: {ctx.base}: command not found\n', '127')
     return None
 
+
+def _cmd_cp(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'cp':
+        if len(ctx.args) < 2:
+            return ResponsePlan('command_not_found', 'cp: missing file operand\n', '1')
+        src, dst = ctx.args[-2], ctx.args[-1]
+        src_p = _resolve_path(src, ctx.cwd)
+        dst_p = _resolve_path(dst, ctx.cwd)
+        if not ctx.fs.exists(src_p):
+            return ResponsePlan('command_not_found',
+                                f"cp: cannot stat '{src}': No such file or directory\n", '1')
+        if ctx.fs.is_dir(src_p):
+            return ResponsePlan('command_not_found',
+                                f"cp: -r not specified; omitting directory '{src}'\n", '1')
+        if not ctx.fs.cp(src_p, dst_p):
+            return ResponsePlan('command_not_found', f"cp: failed to copy '{src}'\n", '1')
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_mv(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'mv':
+        if len(ctx.args) < 2:
+            return ResponsePlan('command_not_found', 'mv: missing file operand\n', '1')
+        src, dst = ctx.args[-2], ctx.args[-1]
+        src_p = _resolve_path(src, ctx.cwd)
+        dst_p = _resolve_path(dst, ctx.cwd)
+        if not ctx.fs.exists(src_p):
+            return ResponsePlan('command_not_found',
+                                f"mv: cannot stat '{src}': No such file or directory\n", '1')
+        if not ctx.fs.mv(src_p, dst_p):
+            return ResponsePlan('command_not_found', f"mv: failed to move '{src}'\n", '1')
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_useradd(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'useradd':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'useradd: missing USERNAME\n', '1')
+        name = [a for a in ctx.args if not a.startswith('-')]
+        if not name:
+            return ResponsePlan('command_not_found', 'useradd: missing USERNAME\n', '1')
+        username = name[0]
+        home = None
+        for i, a in enumerate(ctx.args):
+            if a == '-d' and i + 1 < len(ctx.args):
+                home = ctx.args[i + 1]
+        if not ctx.fs.users.add(username, home=home):
+            return ResponsePlan('command_not_found',
+                                f"useradd: user '{username}' already exists\n", '9')
+        gid = ctx.fs.users.uid(username)
+        ctx.fs.groups.add(username, gid=gid)
+        ctx.fs.groups._groups[username].members.append(username)
+        ctx.fs.refresh_etc()
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_userdel(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'userdel':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'userdel: missing USERNAME\n', '1')
+        name = [a for a in ctx.args if not a.startswith('-')]
+        if not name:
+            return ResponsePlan('command_not_found', 'userdel: missing USERNAME\n', '1')
+        username = name[0]
+        if not ctx.fs.users.remove(username):
+            return ResponsePlan('command_not_found',
+                                f"userdel: user '{username}' does not exist\n", '6')
+        ctx.fs.groups.remove(username)
+        ctx.fs.refresh_etc()
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_groupadd(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'groupadd':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'groupadd: missing GROUP\n', '1')
+        name = [a for a in ctx.args if not a.startswith('-')]
+        if not name:
+            return ResponsePlan('command_not_found', 'groupadd: missing GROUP\n', '1')
+        groupname = name[0]
+        if not ctx.fs.groups.add(groupname):
+            return ResponsePlan('command_not_found',
+                                f"groupadd: group '{groupname}' already exists\n", '9')
+        ctx.fs.refresh_etc()
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_groupdel(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'groupdel':
+        if not ctx.args:
+            return ResponsePlan('command_not_found', 'groupdel: missing GROUP\n', '1')
+        name = [a for a in ctx.args if not a.startswith('-')]
+        if not name:
+            return ResponsePlan('command_not_found', 'groupdel: missing GROUP\n', '1')
+        groupname = name[0]
+        if not ctx.fs.groups.remove(groupname):
+            return ResponsePlan('command_not_found',
+                                f"groupdel: group '{groupname}' does not exist\n", '6')
+        ctx.fs.refresh_etc()
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+_ENV: dict[str, str] = {
+    "HOME": "/root",
+    "USER": "root",
+    "SHELL": "/bin/bash",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "en_US.UTF-8",
+    "TERM": "xterm-256color",
+    "PWD": "/",
+}
+
+
+def _cmd_env(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'env':
+        lines = [f"{k}={v}" for k, v in sorted(_ENV.items())]
+        return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
+    return None
+
+
+def _cmd_printenv(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'printenv':
+        if not ctx.args:
+            lines = [f"{k}={v}" for k, v in sorted(_ENV.items())]
+            return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
+        key = ctx.args[0]
+        val = _ENV.get(key)
+        if val is None:
+            return ResponsePlan('command_output', '', '1')
+        return ResponsePlan('command_output', val + '\n', '0')
+    return None
+
 _ROUTES: tuple = (
     _cmd_ls,
     _cmd_cat,
@@ -544,6 +858,18 @@ _ROUTES: tuple = (
     _cmd_touch,
     _cmd_mkdir,
     _cmd_rm,
+    _cmd_rmdir,
+    _cmd_chmod,
+    _cmd_chown,
+    _cmd_ln,
+    _cmd_cp,
+    _cmd_mv,
+    _cmd_useradd,
+    _cmd_userdel,
+    _cmd_groupadd,
+    _cmd_groupdel,
+    _cmd_env,
+    _cmd_printenv,
     _cmd_tee,
     _cmd_cal,
     _cmd_dd,
@@ -559,10 +885,6 @@ _ROUTES: tuple = (
     _cmd_file,
     _cmd_stat,
     _cmd_mount,
-    _cmd_chmod,
-    _cmd_chown,
-    _cmd_ln,
-    _cmd_rmdir,
     _cmd_realpath,
     _cmd_type,
     _cmd_which,
