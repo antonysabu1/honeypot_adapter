@@ -13,16 +13,23 @@ from ssh_adapter.shell import FakeSSHShell
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
 
-
-def _load_or_create_host_key() -> paramiko.RSAKey:
-    if HOST_KEY_PATH.exists():
-        return paramiko.RSAKey.from_private_key_file(str(HOST_KEY_PATH))
-    key = paramiko.RSAKey.generate(2048)
-    key.write_private_key_file(str(HOST_KEY_PATH))
-    return key
+_HOST_KEY = None
 
 
-HOST_KEY = _load_or_create_host_key()
+def _get_host_key() -> paramiko.RSAKey:
+    """Lazily load (or generate) the server host key.
+
+    Loaded on first use rather than at import time so importing this module
+    (e.g. from tests) has no filesystem side effects.
+    """
+    global _HOST_KEY
+    if _HOST_KEY is None:
+        if HOST_KEY_PATH.exists():
+            _HOST_KEY = paramiko.RSAKey.from_private_key_file(str(HOST_KEY_PATH))
+        else:
+            _HOST_KEY = paramiko.RSAKey.generate(2048)
+            _HOST_KEY.write_private_key_file(str(HOST_KEY_PATH))
+    return _HOST_KEY
 
 
 def _build_event(
@@ -118,10 +125,10 @@ class SSHHandler(socketserver.BaseRequestHandler):
     def handle(self):
         transport = paramiko.Transport(self.request)
         transport.local_version = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"
-        transport.add_server_key(HOST_KEY)
+        transport.add_server_key(_get_host_key())
 
         session_id = create_session_id()
-        session_tracker.start_session(self.client_address[0], "ssh")
+        session_tracker.start_session(self.client_address[0], "ssh", session_id)
 
         log_event(
             _build_event(
@@ -135,24 +142,22 @@ class SSHHandler(socketserver.BaseRequestHandler):
             )
         )
 
-        server = HoneypotSSHServer(session_id, self.client_address)
-        transport.start_server(server=server)
-        chan = transport.accept(20)
-        if chan is None:
-            return
-
-        server.event.wait(10)
-        if chan is None:
-            return
-
-        shell = FakeSSHShell(
-            chan,
-            session_id,
-            self.client_address[0],
-            username=server.username or "root",
-        )
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         try:
+            server = HoneypotSSHServer(session_id, self.client_address)
+            transport.start_server(server=server)
+            chan = transport.accept(20)
+            if chan is None:
+                return
+
+            server.event.wait(10)
+
+            shell = FakeSSHShell(
+                chan,
+                session_id,
+                self.client_address[0],
+                username=server.username or "root",
+            )
             shell.run()
         finally:
             log_event(
@@ -167,7 +172,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
                     "raw_metadata": {},
                     "session_source": "protocol_native",
                     "response_status": "0",
-                    "response_type": "session_ended",
+                    "response_type": "session_end",
                     "mitre_attack_id": None,
                     "mitre_technique_name": None,
                     "mitre_tactic": None,

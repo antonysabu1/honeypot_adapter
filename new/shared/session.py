@@ -10,8 +10,9 @@ class SessionTracker:
     def __init__(self) -> None:
         self._sessions = {}
 
-    def start_session(self, source_ip: str, protocol: str) -> str:
-        session_id = create_session_id()
+    def start_session(self, source_ip: str, protocol: str, session_id: str | None = None) -> str:
+        if session_id is None:
+            session_id = create_session_id()
         self._sessions[session_id] = {
             "source_ip": source_ip,
             "protocol": protocol,

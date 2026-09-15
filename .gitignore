@@ -6,3 +6,4 @@ logs/
 **/host_key
 **/logs/
 old/
+.freebuff/

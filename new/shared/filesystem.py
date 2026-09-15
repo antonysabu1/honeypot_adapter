@@ -109,8 +109,96 @@ class FakeFilesystem:
                 "systemd-private-8d3f1a2b-nginx.service-abc": {},
                 "temp_install.log": "2026-09-08 10:42:13 installer started\n",
             },
-            "bin": {},
-            "sbin": {},
+            "bin": {
+                "bash": "fake bash stub\n",
+                "cat": "fake cat stub\n",
+                "ls": "fake ls stub\n",
+                "less": "fake less stub\n",
+                "vi": "fake vi stub\n",
+                "vim": "fake vim stub\n",
+                "grep": "fake grep stub\n",
+                "egrep": "fake egrep stub\n",
+                "fgrep": "fake fgrep stub\n",
+                "awk": "fake awk stub\n",
+                "sed": "fake sed stub\n",
+                "head": "fake head stub\n",
+                "tail": "fake tail stub\n",
+                "sort": "fake sort stub\n",
+                "uniq": "fake uniq stub\n",
+                "wc": "fake wc stub\n",
+                "cut": "fake cut stub\n",
+                "find": "fake find stub\n",
+                "file": "fake file stub\n",
+                "touch": "fake touch stub\n",
+                "mkdir": "fake mkdir stub\n",
+                "rm": "fake rm stub\n",
+                "tee": "fake tee stub\n",
+                "dd": "fake dd stub\n",
+                "chmod": "fake chmod stub\n",
+                "chown": "fake chown stub\n",
+                "ln": "fake ln stub\n",
+                "rmdir": "fake rmdir stub\n",
+                "which": "fake which stub\n",
+                "stat": "fake stat stub\n",
+                "strings": "fake strings stub\n",
+                "base64": "fake base64 stub\n",
+                "openssl": "fake openssl stub\n",
+                "nc": "fake nc stub\n",
+                "ncat": "fake ncat stub\n",
+                "ping": "fake ping stub\n",
+                "wget": "fake wget stub\n",
+                "curl": "fake curl stub\n",
+                "ssh": "fake ssh stub\n",
+                "scp": "fake scp stub\n",
+                "sftp": "fake sftp stub\n",
+                "kubectl": "fake kubectl stub\n",
+                "ddrescue": "fake ddrescue stub\n",
+                "rsync": "fake rsync stub\n",
+                "rsyncd": "fake rsyncd stub\n",
+                "bash-completion": "fake bash-completion stub\n",
+                "sshd": "fake sshd stub\n",
+                "systemd-sysusers": "fake systemd-sysusers stub\n",
+                "tmpfiles.d": "fake tmpfiles.d stub\n",
+            },
+            "sbin": {
+                "systemctl": "fake systemctl stub\n",
+                "service": "fake service stub\n",
+                "journalctl": "fake journalctl stub\n",
+                "coredumpctl": "fake coredumpctl stub\n",
+                "ip": "fake ip stub\n",
+                "route": "fake route stub\n",
+                "ss": "fake ss stub\n",
+                "netstat": "fake netstat stub\n",
+                "lsof": "fake lsof stub\n",
+                "ifconfig": "fake ifconfig stub\n",
+                "arp": "fake arp stub\n",
+                "find": "fake find stub\n",
+                "file": "fake file stub\n",
+                "stat": "fake stat stub\n",
+                "mount": "fake mount stub\n",
+                "chmod": "fake chmod stub\n",
+                "chown": "fake chown stub\n",
+                "ln": "fake ln stub\n",
+                "rmdir": "fake rmdir stub\n",
+                "which": "fake which stub\n",
+                "stat2": "fake stat stub\n",
+                "strings": "fake strings stub\n",
+                "base64": "fake base64 stub\n",
+                "openssl": "fake openssl stub\n",
+                "nc": "fake nc stub\n",
+                "ncat": "fake ncat stub\n",
+                "ping": "fake ping stub\n",
+                "wget": "fake wget stub\n",
+                "curl": "fake curl stub\n",
+                "ssh": "fake ssh stub\n",
+                "scp": "fake scp stub\n",
+                "sftp": "fake sftp stub\n",
+                "kubectl": "fake kubectl stub\n",
+                "ddrescue": "fake ddrescue stub\n",
+                "rsync": "fake rsync stub\n",
+                "rsyncd": "fake rsyncd stub\n",
+                "bash-completion": "fake bash-completion stub\n",
+            },
             "lib": {},
             "lib64": {},
             "usr": {"bin": {}, "lib": {}, "local": {}},
@@ -171,6 +259,10 @@ class FakeFilesystem:
     def is_dir(self, path: str) -> bool:
         return isinstance(self._resolve(path), dict)
 
+    def is_file(self, path: str) -> bool:
+        node = self._resolve(path)
+        return node is not None and not isinstance(node, dict)
+
     def ls(self, path: str) -> list:
         node = self._resolve(path)
         if isinstance(node, dict):
@@ -184,3 +276,11 @@ class FakeFilesystem:
         if isinstance(node, dict):
             return f"cat: {path}: Is a directory"
         return node
+
+    def file(self, path: str) -> str:
+        node = self._resolve(path)
+        if node is None:
+            return f"{path}: cannot open ({path}: No such file or directory)\n"
+        if isinstance(node, dict):
+            return f"{path}: directory\n"
+        return f"{path}: ASCII text\n"

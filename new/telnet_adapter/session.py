@@ -63,7 +63,16 @@ class TelnetSession:
                 else:  # NOP, GA, IP, AO, ... — consume and ignore
                     i += 2
                 continue
-            if byte == 13:  # \r — ignore
+            if byte == 13:  # \r — process the line (a lone CR must work too)
+                line = self.buffer.decode("utf-8", errors="ignore").strip()
+                self.buffer = b""
+                if line:
+                    self.process_line(line)
+                elif self.state == "shell":
+                    self.transport.write(("\r\n" + self.prompt).encode())
+                # Skip a trailing \n if present (CRLF line ending)
+                if i + 1 < len(buf) and buf[i + 1] == 10:
+                    i += 1
                 i += 1
                 continue
             if byte == 10 or byte == 0:  # \n or NUL ends the line
@@ -143,16 +152,11 @@ class TelnetSession:
             if not line:
                 self.transport.write(("\r\n" + self.prompt).encode())
                 return
-            # Resolve relative paths for cat/ls
+            # Relative file paths are resolved against cwd inside decide_response()
+            # via _resolve_path; args are passed through untouched so flags and
+            # non-path operands (e.g. `which bash`, `date +%Y`, `find -name ...`)
+            # are not corrupted by cwd-joining.
             args = line.split()[1:] if len(line.split()) > 1 else []
-            resolved_args = []
-            for arg in args:
-                # Absolute paths stay untouched; flags (e.g. -la) must NOT be
-                # joined to the cwd or decide_response can't recognize them.
-                if arg.startswith("/") or arg.startswith("-"):
-                    resolved_args.append(arg)
-                else:
-                    resolved_args.append(os.path.join(self.current_dir, arg))
 
             mitre = mitre_analyze(line)
 
@@ -178,7 +182,7 @@ class TelnetSession:
                 "telnet",
                 self.session_id,
                 line,
-                {"args": resolved_args, "cwd": self.current_dir},
+                {"args": args, "cwd": self.current_dir},
                 self.fs,
                 username=self.username or "root",
             )
