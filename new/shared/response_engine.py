@@ -117,7 +117,9 @@ def _cmd_pwd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_whoami(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd == 'whoami':
-        return ResponsePlan('command_output', get_attr("persona.username", "root"), '0')
+        # Use explicitly provided username, then config, then default
+        uname = ctx.username or get_attr("persona.username", "root")
+        return ResponsePlan('command_output', uname, '0')
     return None
 
 def _cmd_uname(ctx: _Ctx) -> ResponsePlan | None:
