@@ -2,11 +2,16 @@ import asyncio
 import os
 import threading
 
+from shared.config import get
+
 import telnet_adapter.server as telnet_server
 
-SSH_ADAPTER = os.environ.get("HONEYPOT_SSH_ADAPTER", "paramiko").strip().lower()
+SSH_ADAPTER = os.environ.get("HONEYPOT_SSH_ADAPTER", get("ssh.adapter", "paramiko")).strip().lower()
 
 VALID_SSH_ADAPTERS = ("paramiko", "asyncssh")
+
+_SSH_PORT = get("ssh.port", 2222)
+_TELNET_PORT = get("telnet.port", 2323)
 
 
 async def _listen(name: str, start) -> bool:
@@ -51,9 +56,9 @@ async def run_telnet_and_asyncssh():
 
 
 if __name__ == "__main__":
-    print("=" * 50)
+print("=" * 50)
     print("Starting honeypot")
-    print("  Telnet -> port 2323")
+    print(f"  Telnet -> port {_TELNET_PORT}")
     print("  Logs   -> logs/honeypot.jsonl")
 
     if SSH_ADAPTER not in VALID_SSH_ADAPTERS:
@@ -66,7 +71,7 @@ if __name__ == "__main__":
         print("=" * 50)
         asyncio.run(run_telnet_and_asyncssh())
     else:
-        print("  SSH    -> port 2222 (adapter: PARAMIKO)")
+        print(f"  SSH    -> port {_SSH_PORT} (adapter: PARAMIKO)")
         print("=" * 50)
         ssh_thread = threading.Thread(target=run_paramiko_ssh, daemon=True)
         ssh_thread.start()
