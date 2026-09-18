@@ -1,0 +1,9 @@
+# SSH honeypot configuration
+enabled: true
+port: 2222
+adapter: paramiko  # or "asyncssh"
+host_key_path: ssh_adapter/host_key
+banner: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"
+default_cwd: "/"
+max_sessions: 100
+session_timeout: 3600
