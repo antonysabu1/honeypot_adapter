@@ -1,5 +1,7 @@
 # Resource limits configuration
 max_sessions: 100
+max_ssh_sessions: 50
+max_telnet_sessions: 50
 session_timeout: 3600
 max_commands_per_session: 500
 max_output_size: 65536
