@@ -11,3 +11,4 @@ os_release: |
   ID_LIKE=debian
 domain: example.com
 login_message: "Last login: Mon Sep  8 10:42:13 2026 from 192.168.1.100"
+username: root
