@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase
+from shared.config import get_attr
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
     FILTERS,
@@ -116,7 +117,7 @@ def _cmd_pwd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_whoami(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd == 'whoami':
-        return ResponsePlan('command_output', ctx.username or 'root', '0')
+        return ResponsePlan('command_output', get_attr("persona.username", "root"), '0')
     return None
 
 def _cmd_uname(ctx: _Ctx) -> ResponsePlan | None:
@@ -142,7 +143,8 @@ def _cmd_echo(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_id(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'id':
-        return ResponsePlan('command_output', 'uid=0(root) gid=0(root) groups=0(root)', '0')
+        uid = get_attr("persona.username", "root")
+        return ResponsePlan('command_output', f'uid=0({uid}) gid=0(root) groups=0(root)', '0')
     return None
 
 def _cmd_date(ctx: _Ctx) -> ResponsePlan | None:
