@@ -19,7 +19,7 @@ import yaml  # imported lazily; pip install pyyaml if missing
 
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 _LOADED: bool = False
- _namespace: dict = {}
+_namespace: dict = {}
 
 
 def _load_yaml(name: str) -> dict:
