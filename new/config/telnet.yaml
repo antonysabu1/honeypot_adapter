@@ -1,0 +1,8 @@
+# Telnet honeypot configuration
+enabled: true
+port: 2323
+banner: "Welcome to Ubuntu 22.04 LTS\r\n\r\n"
+login_prompt: "login: "
+password_prompt: "Password: "
+max_sessions: 100
+session_timeout: 3600
