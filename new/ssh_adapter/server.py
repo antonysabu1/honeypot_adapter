@@ -9,6 +9,14 @@ import paramiko
 
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
+from shared.connection_manager import can_create_session, register_session, unregister_session
+from ssh_adapter.shell import FakeSSHShell
+
+# paramiko is a required third-party dependency. It is installed (v5.0.0).
+import paramiko
+
+from shared.logger import log_event
+from shared.session import create_session_id, tracker as session_tracker
 from ssh_adapter.shell import FakeSSHShell
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
@@ -127,13 +135,32 @@ class SSHHandler(socketserver.BaseRequestHandler):
         transport.local_version = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"
         transport.add_server_key(_get_host_key())
 
+        source_ip = self.client_address[0]
+
+        # ENTRY GATE: Check session limits before creating a session
+        if not can_create_session("ssh", source_ip):
+            log_event(
+                _build_event(
+                    session_id="",
+                    source_ip=source_ip,
+                    protocol="ssh",
+                    action="session_limit_reached",
+                    parameters={"reason": "max_sessions_reached"},
+                    response_status="0",
+                    response_type="session_rejected",
+                )
+            )
+            transport.close()
+            return
+
         session_id = create_session_id()
-        session_tracker.start_session(self.client_address[0], "ssh", session_id)
+        session_tracker.start_session(source_ip, "ssh", session_id)
+        register_session("ssh", source_ip)
 
         log_event(
             _build_event(
                 session_id=session_id,
-                source_ip=self.client_address[0],
+                source_ip=source_ip,
                 protocol="ssh",
                 action="connection_established",
                 parameters={},
@@ -165,7 +192,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
                     "event_id": str(uuid.uuid4()),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "protocol": "ssh",
-                    "source_ip": self.client_address[0],
+                    "source_ip": source_ip,
                     "session_id": session_id,
                     "action": "connection_closed",
                     "parameters": {},
@@ -181,6 +208,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
                     "mitre_confidence": None,
                 }
             )
+            unregister_session("ssh", source_ip)
             session_tracker.end_session(session_id)
             transport.close()
 
