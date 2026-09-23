@@ -3,6 +3,7 @@ import asyncio
 from shared.events import build_event
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
+from shared.connection_manager import can_create_session, register_session, unregister_session
 from shared.shell import LOGIN_BANNER
 from telnet_adapter.session import TelnetSession
 
@@ -10,11 +11,28 @@ from telnet_adapter.session import TelnetSession
 class TelnetServer(asyncio.Protocol):
     def connection_made(self, transport):
         self.transport = transport
-        self.session_id = create_session_id()
         self.source_ip = transport.get_extra_info("peername")[0]
-        self.buffer = b""
+        self.buffer = ""
 
+        # ENTRY GATE: Check session limits before creating a session
+        if not can_create_session("telnet", self.source_ip):
+            log_event(
+                build_event(
+                    session_id="",
+                    source_ip=self.source_ip,
+                    protocol="telnet",
+                    action="session_limit_reached",
+                    parameters={"reason": "max_sessions_reached"},
+                    response_status="0",
+                    response_type="session_rejected",
+                )
+            )
+            self.transport.close()
+            return
+
+        self.session_id = create_session_id()
         session_tracker.start_session(self.source_ip, "telnet", self.session_id)
+        register_session("telnet", self.source_ip)
 
         log_event(
             build_event(
@@ -48,6 +66,7 @@ class TelnetServer(asyncio.Protocol):
                 response_type="session_end",
             )
         )
+        unregister_session("telnet", self.source_ip)
         session_tracker.end_session(self.session_id)
 
 
