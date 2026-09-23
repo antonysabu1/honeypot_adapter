@@ -63,8 +63,27 @@ def load() -> dict:
 
 
 def get(key: str, default: object = None) -> object:
-    """Retrieve a config value by dot‑free key (e.g. ``ssh.port``)."""
+    """Retrieve a config value by dot‑free key (e.g. ``ssh.port``).
+
+    The shared config namespace is flat (all YAML keys merged at top level).
+    This function supports accessing values by their last-component key name,
+    e.g. ``get("ssh.port")`` will find the flat key ``"port"``.
+    """
+    # 1. Try exact flat-key lookup first
+    if key in _namespace:
+        return _namespace[key]
+
+    # 2. Try splitting dotted key and matching the last part as a flat key
+    #    e.g. "ssh.port" → look up flat key "port"
+    #    e.g. "limits.max_ssh_sessions" → look up flat key "max_ssh_sessions"
     parts = key.split(".", 1)
+    if len(parts) == 2:
+        prefix, sub_key = parts
+        if sub_key in _namespace:
+            return _namespace[sub_key]
+
+    # 3. Fall back to original dotted traversal (for nested namespaces)
+    parts = key.split(".")
     obj = _namespace
     for p in parts:
         if not isinstance(obj, dict) or p not in obj:
