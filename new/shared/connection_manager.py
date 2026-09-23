@@ -102,8 +102,9 @@ def unregister_session(protocol: str, source_ip: str) -> None:
 
 def _refresh_timestamps() -> None:
     """Optionally prune stale IP entries based on session_timeout."""
+    from shared.config import get
     now = time.time()
-    timeout = __import__("shared.config").get("limits.session_timeout", 3600)
+    timeout = get("limits.session_timeout", 3600)
     # Simple prune: IPs with no recent activity can have their counters reset
     # This is optional and depends on deployment; keep it minimal for now.
     pass
