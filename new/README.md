@@ -24,3 +24,26 @@ telnet localhost 2323
 ## Logs
 All events are written to logs/honeypot.jsonl.
 Each line is a JSON object with the shared schema.
+
+## Structure
+
+`shared/` owns everything the transports have in common; each adapter owns
+only what is genuinely protocol-specific.
+
+| Module | Owns |
+|---|---|
+| `shared/response_engine.py` | One handler per command in `_ROUTES` (tried in order), plus `decide_line()` for `;` / `&&` / `||` lines |
+| `shared/shell.py` | Banner, prompt, argument split, keystroke handling (`LineEditor`), `cd` policy (`resolve_cd`) |
+| `shared/shell_syntax.py` | Pipelines and redirections (`>`, `>>`, `2>`, `2>&1`, `&>`, `<`, `/dev/null`): parsing, filter stages, which stream is hidden. Pure — it knows no commands, so the engine still runs every stage. The engine's `grep`/`head`/`tail`/`cut`/`sort`/`uniq`/`wc` handlers call these same filters |
+| `shared/events.py` | The single telemetry event builder |
+| `shared/filesystem.py` | The fake filesystem (single owner of simulated file state), including the identity databases: `UserDatabase` → `VirtualUser` and `GroupDatabase` → `VirtualGroup`. `/etc/passwd` and `/etc/group` are *generated* from these (`refresh_etc()`), never kept beside them. Primary group membership lives in `VirtualUser.gid`; `VirtualGroup.members` holds supplementary members only, which is what keeps the two files consistent |
+| `shared/mitre.py`, `shared/logger.py`, `shared/session.py` | Detection tagging, JSONL logging, session tracker |
+| `ssh_adapter/` | Paramiko transport: TCP server + shell wired to the shared helpers |
+| `telnet_adapter/` | Telnet framing (IAC), login state machine, its own line handling |
+| `asyncssh_adapter/` | AsyncSSH transport: server + shell, selected with `HONEYPOT_SSH_ADAPTER=asyncssh` |
+
+Data flows one way: transport reads bytes → `LineEditor` → command line →
+`decide_line()` / `decide_response()` → `ResponsePlan` → transport renders it
+and emits one event through `shared.events.build_event`. The transport owns the
+session's cwd; the sequencer borrows it for the length of a line and hands the
+resulting value back.

@@ -1,0 +1,6 @@
+# Honeypot global configuration
+log_dir: logs
+db_path: logs/honeypot.db
+default_username: root
+default_protocol: ssh
+mime_type: text/plain

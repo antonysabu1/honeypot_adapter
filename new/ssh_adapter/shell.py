@@ -1,15 +1,29 @@
-import os
-import uuid
-from datetime import datetime, timezone
-
-from shared.logger import log_event
-from shared.response_engine import decide_response
+from shared.events import build_event
 from shared.filesystem import FakeFilesystem
+from shared.logger import log_event
 from shared.mitre import mitre_analyze
+from shared.response_engine import (
+    decide_line,
+    decide_response,
+    has_shell_syntax,
+)
+from shared.shell import (
+    LineEditor,
+    POST_LOGIN_BANNER,
+    parse_args,
+    prompt_for,
+    resolve_cd,
+)
 
 
 class FakeSSHShell:
-    # SAFETY: No real auth — always returns success
+    """Paramiko transport shell.
+
+    Everything a shell *presents* (banner, prompt, keystroke echo, cd policy)
+    comes from shared.shell; this class only owns the channel it writes to and
+    the telemetry it emits.
+    """
+
     def __init__(self, channel, session_id, source_ip, username="root"):
         self.channel = channel
         self.session_id = session_id
@@ -20,26 +34,38 @@ class FakeSSHShell:
         self.current_dir = "/root"
         # The honeypot always presents a root shell; only whoami reflects the
         # actual login user (per session-isolation report recommendation).
-        self.prompt = "root@honeypot:~# "
+        self.prompt = prompt_for(self.current_dir)
         self._closed = False
-
-    def _shorten_path(self, path: str) -> str:
-        return path.replace("/root", "~")
-
-    def _update_prompt(self):
-        self.prompt = f"root@honeypot:{self._shorten_path(self.current_dir)}# "
-
-    def run(self):
-        self.channel.send("\r\nWelcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-105-generic x86_64)\r\n\r\n".encode())
-        motd = (
-            " * Documentation:  https://help.ubuntu.com\r\n"
-            " * Management:     https://landscape.canonical.com\r\n"
-            " * Support:        https://ubuntu.com/advantage\r\n\r\n"
-            "Last login: Mon Sep  8 10:42:13 2026 from 192.168.1.100\r\n\r\n"
+        self._editor = LineEditor(
+            write=self.channel.send,
+            prompt=lambda: self.prompt,
+            on_command=self.handle_command,
+            on_closed=lambda: self._closed,
         )
-        self.channel.send(motd.encode())
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+    def _log(self, cmd: str, response_status: str, response_type: str,
+             mitre: dict, parameters: dict | None = None):
+        log_event(build_event(
+            session_id=self.session_id,
+            source_ip=self.source_ip,
+            protocol="ssh",
+            action=cmd,
+            parameters=parameters if parameters is not None else {"command": cmd},
+            response_status=response_status,
+            response_type=response_type,
+            mitre=mitre,
+        ))
+
+    # ------------------------------------------------------------------
+    # Session loop
+    # ------------------------------------------------------------------
+    def run(self):
+        self.channel.send(POST_LOGIN_BANNER.encode())
         self.channel.send(self.prompt.encode())
-        buffer = b""
+
         while not self._closed:
             try:
                 data = self.channel.recv(1024)
@@ -47,41 +73,7 @@ class FakeSSHShell:
                 break
             if not data:
                 break
-
-            i = 0
-            while i < len(data):
-                byte = data[i]
-
-                if byte == 13:  # \r — Enter in PTY mode
-                    cmd = buffer.decode("utf-8", errors="ignore").strip()
-                    buffer = b""
-                    if cmd:
-                        self.handle_command(cmd)
-                    else:
-                        self.channel.send(("\r\n" + self.prompt).encode())
-                    # Skip the following \n if present (Windows/SSH clients send \r\n)
-                    if i + 1 < len(data) and data[i + 1] == 10:
-                        i += 1
-                elif byte == 10:  # \n — standalone newline
-                    cmd = buffer.decode("utf-8", errors="ignore").strip()
-                    buffer = b""
-                    if cmd:
-                        self.handle_command(cmd)
-                    else:
-                        self.channel.send(("\r\n" + self.prompt).encode())
-                elif byte == 127:  # backspace
-                    if buffer:
-                        buffer = buffer[:-1]
-                        self.channel.send(b"\b \b")
-                elif byte == 3:  # Ctrl+C
-                    buffer = b""
-                    self.channel.send(b"^C\r\n" + self.prompt.encode())
-                elif 32 <= byte <= 126:  # printable ASCII
-                    buffer += bytes([byte])
-                    self.channel.send(bytes([byte]))
-                # Ignore other control bytes silently
-
-                i += 1
+            self._editor.feed(data)
 
     def handle_command(self, cmd: str):
         # FIX: Rewrite bare "cd" BEFORE decide_response
@@ -89,142 +81,73 @@ class FakeSSHShell:
             cmd = "cd /root"
 
         mitre = mitre_analyze(cmd)
-
-        log_event(
-            {
-                "event_id": str(uuid.uuid4()),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "protocol": "ssh",
-                "source_ip": self.source_ip,
-                "session_id": self.session_id,
-                "action": cmd,
-                "parameters": {"command": cmd},
-                "raw_metadata": {},
-                "session_source": "protocol_native",
-                "response_status": "0",
-                "response_type": "pending",
-                **mitre,
-            }
-        )
+        self._log(cmd, "0", "pending", mitre)
 
         # SAFETY: No subprocess/os.system — all responses via decide_response()
-        args = self._parse_args(cmd)
-        resolved_args = []
-        for arg in args:
-            # Absolute paths stay untouched; flags (e.g. -la) must NOT be joined
-            # to the cwd or decide_response can't recognize them.
-            if arg.startswith("/") or arg.startswith("-"):
-                resolved_args.append(arg)
-            else:
-                resolved_args.append(os.path.join(self.current_dir, arg))
+        # args are passed through untouched so flags and non-path operands
+        # (e.g. `which bash`, `date +%Y`, `find -name ...`) are not corrupted;
+        # relative paths are resolved against cwd inside the engine.
+        args = parse_args(cmd)
 
-        response = decide_response(
-            "ssh",
-            self.session_id,
-            cmd,
-            {"args": resolved_args, "cwd": self.current_dir},
-            self.fs,
-            username=self.username,
-        )
+        # `;` / `&&` / `||` / `|` / redirection lines go to the shared line path,
+        # which also resolves any `cd` segment and hands back the resulting cwd.
+        chained = has_shell_syntax(cmd)
+        if chained:
+            response, new_cwd = decide_line(
+                "ssh",
+                self.session_id,
+                cmd,
+                {"args": args, "cwd": self.current_dir},
+                self.fs,
+                username=self.username,
+            )
+            self._apply_cwd(new_cwd)
+        else:
+            response = decide_response(
+                "ssh",
+                self.session_id,
+                cmd,
+                {"args": args, "cwd": self.current_dir},
+                self.fs,
+                username=self.username,
+            )
 
         if response.response_type == "session_end":
-            self.channel.send("\r\nlogout\r\n".encode())
-            log_event(
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "protocol": "ssh",
-                    "source_ip": self.source_ip,
-                    "session_id": self.session_id,
-                    "action": cmd,
-                    "parameters": {"command": cmd},
-                    "raw_metadata": {},
-                    "session_source": "protocol_native",
-                    "response_status": "0",
-                    "response_type": "session_end",
-                    **mitre,
-                }
-            )
+            self.channel.send(b"\r\nlogout\r\n")
+            self._log(cmd, "0", "session_end", mitre)
             self._closed = True
             return
 
-        if cmd.startswith("cd "):
-            path = cmd[3:].strip()
-            if not path:
-                path = "/root"
-            elif not path.startswith("/"):
-                path = os.path.join(self.current_dir, path)
-
-            # Normalize: /root/../etc → /etc, /root/.... → /root/....
-            normalized = os.path.normpath(path)
-
-            # Validate against FakeFilesystem
-            if not self.fs.exists(normalized):
-                error_msg = f"bash: cd: {path}: No such file or directory"
-                self.channel.send(("\r\n" + error_msg + "\r\n" + self.prompt).encode())
-                # Log the failed attempt
-                log_event(
-                    {
-                        "event_id": str(uuid.uuid4()),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "protocol": "ssh",
-                        "source_ip": self.source_ip,
-                        "session_id": self.session_id,
-                        "action": cmd,
-                        "parameters": {"command": cmd, "target": path},
-                        "raw_metadata": {},
-                        "session_source": "protocol_native",
-                        "response_status": "1",
-                        "response_type": "cd_failed",
-                        **mitre,
-                    }
-                )
+        if not chained and cmd.startswith("cd "):
+            if not self._handle_cd(cmd, mitre):
                 return
-            if not self.fs.is_dir(normalized):
-                error_msg = f"bash: cd: {path}: Not a directory"
-                self.channel.send(("\r\n" + error_msg + "\r\n" + self.prompt).encode())
-                log_event(
-                    {
-                        "event_id": str(uuid.uuid4()),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "protocol": "ssh",
-                        "source_ip": self.source_ip,
-                        "session_id": self.session_id,
-                        "action": cmd,
-                        "parameters": {"command": cmd, "target": path},
-                        "raw_metadata": {},
-                        "session_source": "protocol_native",
-                        "response_status": "1",
-                        "response_type": "cd_failed",
-                        **mitre,
-                    }
-                )
-                return
-
-            self.current_dir = normalized
-            self._update_prompt()
 
         # Normalize \n to \r\n for PTY display
         content = response.content.replace("\n", "\r\n")
         self.channel.send(("\r\n" + content + "\r\n" + self.prompt).encode())
 
-        log_event(
-            {
-                "event_id": str(uuid.uuid4()),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "protocol": "ssh",
-                "source_ip": self.source_ip,
-                "session_id": self.session_id,
-                "action": cmd,
-                "parameters": {"command": cmd},
-                "raw_metadata": {},
-                "session_source": "protocol_native",
-                "response_status": response.status,
-                "response_type": response.response_type,
-                **mitre,
-            }
-        )
+        # A redirected write target is intel: record it, never print it.
+        params = {"command": cmd}
+        if response.redirect:
+            params["redirect"] = response.redirect
+        self._log(cmd, response.status, response.response_type, mitre, params)
 
-    def _parse_args(self, cmd: str) -> list:
-        parts = cmd.split()
-        return parts[1:] if len(parts) > 1 else []
+    def _apply_cwd(self, new_cwd: str) -> None:
+        if new_cwd != self.current_dir:
+            self.current_dir = new_cwd
+            self.prompt = prompt_for(self.current_dir)
+
+    def _handle_cd(self, cmd: str, mitre: dict) -> bool:
+        """Perform `cd`; returns False when the move failed (already reported)."""
+        result = resolve_cd(cmd[3:].strip(), self.current_dir, self.fs)
+        if result.ok:
+            self._apply_cwd(result.cwd)
+            return True
+
+        self.channel.send(("\r\n" + result.error + "\r\n" + self.prompt).encode())
+        # Log the failed attempt with its target, as before.
+        self._log(
+            cmd, "1", "cd_failed", mitre,
+            {"command": cmd, "target": result.path},
+        )
+        return False

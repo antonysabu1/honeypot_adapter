@@ -1,1 +1,2 @@
 paramiko>=2.12.0
+PyYAML>=6.0

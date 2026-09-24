@@ -1,54 +1,41 @@
 import asyncio
-from datetime import datetime, timezone
-import uuid
 
+from shared.events import build_event
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
+from shared.connection_manager import can_create_session, register_session, unregister_session
+from shared.shell import LOGIN_BANNER
 from telnet_adapter.session import TelnetSession
-
-
-def _build_event(
-    session_id,
-    source_ip,
-    protocol,
-    action,
-    parameters,
-    response_status,
-    response_type,
-) -> dict:
-    return {
-        "event_id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "protocol": protocol,
-        "source_ip": source_ip,
-        "session_id": session_id,
-        "action": action,
-        "parameters": parameters,
-        "raw_metadata": {},
-        "session_source": "protocol_native",
-        "response_status": response_status,
-        "response_type": response_type,
-        # Lifecycle events are not attacker commands, so MITRE fields are null.
-        "mitre_attack_id": None,
-        "mitre_technique_name": None,
-        "mitre_tactic": None,
-        "mitre_attack_id_secondary": None,
-        "mitre_technique_name_secondary": None,
-        "mitre_confidence": None,
-    }
 
 
 class TelnetServer(asyncio.Protocol):
     def connection_made(self, transport):
         self.transport = transport
-        self.session_id = create_session_id()
         self.source_ip = transport.get_extra_info("peername")[0]
-        self.buffer = b""
+        self.buffer = ""
 
-        session_tracker.start_session(self.source_ip, "telnet")
+        # ENTRY GATE: Check session limits before creating a session
+        if not can_create_session("telnet", self.source_ip):
+            log_event(
+                build_event(
+                    session_id="",
+                    source_ip=self.source_ip,
+                    protocol="telnet",
+                    action="session_limit_reached",
+                    parameters={"reason": "max_sessions_reached"},
+                    response_status="0",
+                    response_type="session_rejected",
+                )
+            )
+            self.transport.close()
+            return
+
+        self.session_id = create_session_id()
+        session_tracker.start_session(self.source_ip, "telnet", self.session_id)
+        register_session("telnet", self.source_ip)
 
         log_event(
-            _build_event(
+            build_event(
                 session_id=self.session_id,
                 source_ip=self.source_ip,
                 protocol="telnet",
@@ -59,7 +46,7 @@ class TelnetServer(asyncio.Protocol):
             )
         )
 
-        self.transport.write(b"\r\nWelcome to Ubuntu 22.04 LTS\r\n\r\n")
+        self.transport.write(LOGIN_BANNER.encode())
         self.transport.write(b"login: ")
         self.session = TelnetSession(self.transport, self.session_id, self.source_ip)
 
@@ -69,16 +56,17 @@ class TelnetServer(asyncio.Protocol):
 
     def connection_lost(self, exc):
         log_event(
-            _build_event(
+            build_event(
                 session_id=self.session_id,
                 source_ip=self.source_ip,
                 protocol="telnet",
                 action="connection_closed",
                 parameters={},
                 response_status="0",
-                response_type="session_ended",
+                response_type="session_end",
             )
         )
+        unregister_session("telnet", self.source_ip)
         session_tracker.end_session(self.session_id)
 
 
