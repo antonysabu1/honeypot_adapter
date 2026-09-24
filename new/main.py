@@ -56,7 +56,7 @@ async def run_telnet_and_asyncssh():
 
 
 if __name__ == "__main__":
-print("=" * 50)
+    print("=" * 50)
     print("Starting honeypot")
     print(f"  Telnet -> port {_TELNET_PORT}")
     print("  Logs   -> logs/honeypot.jsonl")

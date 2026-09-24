@@ -79,7 +79,14 @@ _GROUP_HEADER = (
 
 
 @dataclass
-class _UserEntry:
+class VirtualUser:
+    """One entry of the virtual user database (one /etc/passwd line).
+
+    ``name`` mirrors the key it is stored under in UserDatabase; only the
+    database mutates entries, so the two cannot drift apart.
+    """
+
+    name: str
     uid: int
     gid: int
     gecos: str
@@ -88,9 +95,32 @@ class _UserEntry:
 
 
 @dataclass
-class _GroupEntry:
+class VirtualGroup:
+    """One entry of the virtual group database (one /etc/group line).
+
+    ``members`` holds *supplementary* members only. Primary membership is owned
+    by ``VirtualUser.gid``, exactly as /etc/passwd's gid field relates to
+    /etc/group's member list; keeping primary members out of ``members`` is
+    what keeps the two files consistent.
+    """
+
+    name: str
     gid: int
-    members: list[str]
+    members: list[str] = field(default_factory=list)
+    created: datetime = field(default_factory=lambda: _BOOT)
+
+
+def valid_name(name: object) -> bool:
+    """Shared name rule for virtual users and groups.
+
+    Rejects empty names and any character that would corrupt a colon/comma
+    separated /etc/passwd or /etc/group line.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if any(ch in name for ch in ":\n\0,"):
+        return False
+    return True
 
 
 class UserDatabase:
@@ -105,14 +135,14 @@ class UserDatabase:
             parts = line.split(":")
             if len(parts) >= 7:
                 name, _, uid_s, gid_s, gecos, home, shell = parts[:7]
-                self._users[name] = _UserEntry(
-                    uid=int(uid_s), gid=int(gid_s),
+                self._users[name] = VirtualUser(
+                    name=name, uid=int(uid_s), gid=int(gid_s),
                     gecos=gecos, home=home, shell=shell,
                 )
 
     # ── queries ──────────────────────────────────────────────────────────
 
-    def get(self, name: str) -> _UserEntry | None:
+    def get(self, name: str) -> VirtualUser | None:
         return self._users.get(name)
 
     def uid(self, name: str) -> int | None:
@@ -125,22 +155,43 @@ class UserDatabase:
                 return name
         return None
 
+    def name_by_gid(self, gid: int) -> str | None:
+        """Name of the user whose *primary* group is ``gid``, if any."""
+        for name, u in self._users.items():
+            if u.gid == gid:
+                return name
+        return None
+
     def all_names(self) -> list[str]:
         return list(self._users.keys())
 
     def next_uid(self) -> int:
-        return max((u.uid for u in self._users.values()), default=1000) + 1
+        """Lowest free id at or above 1000.
+
+        Starting from the global maximum would hand the next user an id above
+        the reserved system range (nobody is 65534), which is neither realistic
+        nor what useradd does.
+        """
+        used = {u.uid for u in self._users.values()}
+        uid = 1000
+        while uid in used:
+            uid += 1
+        return uid
 
     # ── mutations ────────────────────────────────────────────────────────
 
     def add(self, name: str, *, uid: int | None = None, gid: int | None = None,
             home: str | None = None, shell: str = "/bin/bash") -> bool:
+        # Shared rule: no name that would corrupt a /etc/passwd line.
+        if not valid_name(name):
+            return False
         if name in self._users:
             return False
         uid = uid or self.next_uid()
         gid = gid if gid is not None else uid
         home = home or f"/home/{name}"
-        self._users[name] = _UserEntry(uid=uid, gid=gid, gecos=name, home=home, shell=shell)
+        self._users[name] = VirtualUser(
+            name=name, uid=uid, gid=gid, gecos=name, home=home, shell=shell)
         return True
 
     def remove(self, name: str) -> bool:
@@ -157,8 +208,15 @@ class UserDatabase:
 
 
 class GroupDatabase:
+    """The single source of truth for virtual group state.
+
+    Keyed by group name. ``members`` holds supplementary members only; a user's
+    primary group is the gid on their VirtualUser, so no membership is recorded
+    twice. /etc/group is generated from this object, never maintained beside it.
+    """
+
     def __init__(self) -> None:
-        self._groups: dict[str, _GroupEntry] = {}
+        self._groups: dict[str, VirtualGroup] = {}
         self._parse(_GROUP_HEADER)
 
     def _parse(self, text: str) -> None:
@@ -167,26 +225,87 @@ class GroupDatabase:
             if len(parts) >= 4:
                 name, _, gid_s, members_s = parts[:4]
                 members = [m for m in members_s.split(",") if m]
-                self._groups[name] = _GroupEntry(gid=int(gid_s), members=members)
+                self._groups[name] = VirtualGroup(
+                    name=name, gid=int(gid_s), members=members)
 
-    def get(self, name: str) -> _GroupEntry | None:
+    # ── queries ──────────────────────────────────────────────────────────
+
+    def get(self, name: str) -> VirtualGroup | None:
         return self._groups.get(name)
+
+    def exists(self, name: str) -> bool:
+        return name in self._groups
 
     def gid(self, name: str) -> int | None:
         g = self._groups.get(name)
         return g.gid if g else None
 
+    def name_by_gid(self, gid: int) -> str | None:
+        for name, g in self._groups.items():
+            if g.gid == gid:
+                return name
+        return None
+
+    def gid_in_use(self, gid: int) -> bool:
+        return any(g.gid == gid for g in self._groups.values())
+
+    def all_names(self) -> list[str]:
+        return list(self._groups.keys())
+
+    def memberships_for(self, username: str) -> list[str]:
+        """Groups where ``username`` is a *supplementary* member."""
+        return [name for name, g in self._groups.items() if username in g.members]
+
+    # ── mutations ────────────────────────────────────────────────────────
+
     def next_gid(self) -> int:
-        return max((g.gid for g in self._groups.values()), default=1000) + 1
+        """Lowest free gid at or above 1000 (see UserDatabase.next_uid)."""
+        used = {g.gid for g in self._groups.values()}
+        gid = 1000
+        while gid in used:
+            gid += 1
+        return gid
 
     def add(self, name: str, *, gid: int | None = None) -> bool:
-        if name in self._groups:
+        if not valid_name(name) or name in self._groups:
             return False
-        self._groups[name] = _GroupEntry(gid=gid or self.next_gid(), members=[])
+        if gid is not None and self.gid_in_use(gid):
+            return False
+        self._groups[name] = VirtualGroup(
+            name=name, gid=gid if gid is not None else self.next_gid())
         return True
 
     def remove(self, name: str) -> bool:
         return self._groups.pop(name, None) is not None
+
+    def add_user_to_group(self, username: str, groupname: str) -> bool:
+        g = self._groups.get(groupname)
+        if g is None or username in g.members:
+            return False
+        g.members.append(username)
+        return True
+
+    def remove_user_from_group(self, username: str, groupname: str) -> bool:
+        g = self._groups.get(groupname)
+        if g is None or username not in g.members:
+            return False
+        g.members.remove(username)
+        return True
+
+    def remove_member_everywhere(self, username: str) -> int:
+        """Drop ``username`` from every group's supplementary member list."""
+        removed = 0
+        for g in self._groups.values():
+            if username in g.members:
+                g.members.remove(username)
+                removed += 1
+        return removed
+
+    def get_members(self, groupname: str) -> list[str]:
+        g = self._groups.get(groupname)
+        return list(g.members) if g else []
+
+    # ── /etc/group generation ────────────────────────────────────────────
 
     def group_line(self, name: str) -> str:
         g = self._groups[name]
@@ -494,10 +613,7 @@ class FakeFilesystem:
         return f"{mode_str} 1 {uname:>8} {gname:>8} {sz:>6} {ts} {name}"
 
     def _group_name(self, gid: int) -> str | None:
-        for name, g in self._groups._groups.items():
-            if g.gid == gid:
-                return name
-        return None
+        return self._groups.name_by_gid(gid)
 
     # ── mutations ────────────────────────────────────────────────────────
 
@@ -618,6 +734,10 @@ class FakeFilesystem:
     @property
     def groups(self) -> GroupDatabase:
         return self._groups
+
+    def user_with_primary_gid(self, gid: int) -> str | None:
+        """Name of the user whose primary group is ``gid``, if any."""
+        return self._users.name_by_gid(gid)
 
     def refresh_etc(self) -> None:
         """Regenerate /etc/passwd and /etc/group after user/group changes."""

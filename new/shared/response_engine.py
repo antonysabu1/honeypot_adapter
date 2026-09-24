@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from datetime import datetime, timezone
 
-from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase
+from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase, valid_name
 from shared.config import get_attr
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
@@ -117,9 +117,9 @@ def _cmd_pwd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_whoami(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd == 'whoami':
-        # Use explicitly provided username, then config, then default
-        uname = ctx.username or get_attr("persona.username", "root")
-        return ResponsePlan('command_output', uname, '0')
+        # `whoami` reflects the identity presented at login; `id`/`groups`
+        # additionally resolve it against the virtual user database.
+        return ResponsePlan('command_output', _login_username(ctx), '0')
     return None
 
 def _cmd_uname(ctx: _Ctx) -> ResponsePlan | None:
@@ -143,10 +143,50 @@ def _cmd_echo(ctx: _Ctx) -> ResponsePlan | None:
         return ResponsePlan('command_output', ctx.cmd[5:].strip(), '0')
     return None
 
+def _login_username(ctx: _Ctx) -> str:
+    """The identity presented at login (defaults to the persona's user)."""
+    return ctx.username or get_attr("persona.username", "root")
+
+
+def _group_names_for(fs: FakeFilesystem, uname: str, primary_gid: int) -> list[str]:
+    """A user's groups the way `groups`/`id` report them: primary first.
+
+    The primary group comes from the user's gid; the rest are the groups that
+    name the user in /etc/group.  Both sources are the same databases that
+    generate the two files, so this cannot disagree with `cat /etc/passwd` or
+    `cat /etc/group`.
+    """
+    names: list[str] = []
+    primary = fs.groups.name_by_gid(primary_gid)
+    names.append(primary if primary else str(primary_gid))
+    for gname in fs.groups.memberships_for(uname):
+        g = fs.groups.get(gname)
+        if g and g.gid != primary_gid:
+            names.append(gname)
+    return names
+
+
 def _cmd_id(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'id':
-        uid = get_attr("persona.username", "root")
-        return ResponsePlan('command_output', f'uid=0({uid}) gid=0(root) groups=0(root)', '0')
+        # `id alice` names the user; bare `id` names the login user.
+        asked = _operands(ctx.args)
+        uname = asked[0] if asked else _login_username(ctx)
+        u = ctx.fs.users.get(uname)
+        if u:
+            gname = ctx.fs.groups.name_by_gid(u.gid) or str(u.gid)
+            gids = [f"{u.gid}({gname})"]
+            for name in _group_names_for(ctx.fs, uname, u.gid)[1:]:
+                g = ctx.fs.groups.get(name)
+                gids.append(f"{g.gid}({name})" if g else name)
+            return ResponsePlan(
+                'command_output',
+                f"uid={u.uid}({uname}) gid={u.gid}({gname}) groups={','.join(gids)}",
+                '0')
+        if asked:
+            return ResponsePlan('command_not_found',
+                                f"id: '{uname}': no such user\n", '1')
+        # Not a virtual user (an accepted-but-unknown login): root, as before.
+        return ResponsePlan('command_output', 'uid=0(root) gid=0(root) groups=0(root)', '0')
     return None
 
 def _cmd_date(ctx: _Ctx) -> ResponsePlan | None:
@@ -731,24 +771,47 @@ def _cmd_mv(ctx: _Ctx) -> ResponsePlan | None:
     return None
 
 
+def _operands(args: list, value_flags: tuple = ()) -> list:
+    """Positional arguments, skipping flags and the values they consume.
+
+    `useradd -d /home/x bob` has one operand (`bob`), not two: the path is the
+    value of `-d`.  Without this the flag's value is mistaken for the name.
+    """
+    out: list = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in value_flags:
+            skip = True
+            continue
+        if a.startswith('-'):
+            continue
+        out.append(a)
+    return out
+
+
 def _cmd_useradd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'useradd':
-        if not ctx.args:
+        names = _operands(ctx.args, value_flags=('-d', '-u', '-g', '-s'))
+        if not names:
             return ResponsePlan('command_not_found', 'useradd: missing USERNAME\n', '1')
-        name = [a for a in ctx.args if not a.startswith('-')]
-        if not name:
-            return ResponsePlan('command_not_found', 'useradd: missing USERNAME\n', '1')
-        username = name[0]
+        username = names[0]
         home = None
         for i, a in enumerate(ctx.args):
             if a == '-d' and i + 1 < len(ctx.args):
                 home = ctx.args[i + 1]
         if not ctx.fs.users.add(username, home=home):
-            return ResponsePlan('command_not_found',
+            return ResponsePlan('command_output',
                                 f"useradd: user '{username}' already exists\n", '9')
-        gid = ctx.fs.users.uid(username)
+        # A user gets a private primary group named after them, with the same
+        # numeric id where it is free.  The user is deliberately *not* listed in
+        # that group's members: primary membership lives in /etc/passwd's gid
+        # field, which is what keeps the two files consistent.
+        uid = ctx.fs.users.uid(username)
+        gid = uid if not ctx.fs.groups.gid_in_use(uid) else ctx.fs.groups.next_gid()
         ctx.fs.groups.add(username, gid=gid)
-        ctx.fs.groups._groups[username].members.append(username)
         ctx.fs.refresh_etc()
         return ResponsePlan('command_output', '', '0')
     return None
@@ -756,15 +819,16 @@ def _cmd_useradd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_userdel(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'userdel':
-        if not ctx.args:
+        names = _operands(ctx.args, value_flags=('-r',))
+        if not names:
             return ResponsePlan('command_not_found', 'userdel: missing USERNAME\n', '1')
-        name = [a for a in ctx.args if not a.startswith('-')]
-        if not name:
-            return ResponsePlan('command_not_found', 'userdel: missing USERNAME\n', '1')
-        username = name[0]
+        username = names[0]
         if not ctx.fs.users.remove(username):
             return ResponsePlan('command_not_found',
                                 f"userdel: user '{username}' does not exist\n", '6')
+        # Leave no dangling references: drop supplementary membership everywhere,
+        # then the user's private primary group.
+        ctx.fs.groups.remove_member_everywhere(username)
         ctx.fs.groups.remove(username)
         ctx.fs.refresh_etc()
         return ResponsePlan('command_output', '', '0')
@@ -773,15 +837,39 @@ def _cmd_userdel(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_groupadd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'groupadd':
-        if not ctx.args:
+        gid = None
+        operands: list = []
+        skip = False
+        for i, a in enumerate(ctx.args):
+            if skip:
+                skip = False
+                continue
+            if a == '-g':
+                skip = True
+                if i + 1 < len(ctx.args):
+                    try:
+                        gid = int(ctx.args[i + 1])
+                    except ValueError:
+                        return ResponsePlan(
+                            'command_not_found',
+                            f"groupadd: invalid group ID '{ctx.args[i + 1]}'\n", '3')
+                continue
+            if a.startswith('-'):
+                continue
+            operands.append(a)
+        if not operands:
             return ResponsePlan('command_not_found', 'groupadd: missing GROUP\n', '1')
-        name = [a for a in ctx.args if not a.startswith('-')]
-        if not name:
-            return ResponsePlan('command_not_found', 'groupadd: missing GROUP\n', '1')
-        groupname = name[0]
-        if not ctx.fs.groups.add(groupname):
-            return ResponsePlan('command_not_found',
+        groupname = operands[0]
+        if not valid_name(groupname):
+            return ResponsePlan('command_output',
+                                f"groupadd: invalid group name '{groupname}'\n", '3')
+        if ctx.fs.groups.exists(groupname):
+            return ResponsePlan('command_output',
                                 f"groupadd: group '{groupname}' already exists\n", '9')
+        if gid is not None and ctx.fs.groups.gid_in_use(gid):
+            return ResponsePlan('command_output',
+                                f"groupadd: GID '{gid}' already exists\n", '4')
+        ctx.fs.groups.add(groupname, gid=gid)
         ctx.fs.refresh_etc()
         return ResponsePlan('command_output', '', '0')
     return None
@@ -789,17 +877,84 @@ def _cmd_groupadd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_groupdel(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'groupdel':
-        if not ctx.args:
+        operands = _operands(ctx.args)
+        if not operands:
             return ResponsePlan('command_not_found', 'groupdel: missing GROUP\n', '1')
-        name = [a for a in ctx.args if not a.startswith('-')]
-        if not name:
-            return ResponsePlan('command_not_found', 'groupdel: missing GROUP\n', '1')
-        groupname = name[0]
-        if not ctx.fs.groups.remove(groupname):
+        groupname = operands[0]
+        group = ctx.fs.groups.get(groupname)
+        if group is None:
             return ResponsePlan('command_not_found',
                                 f"groupdel: group '{groupname}' does not exist\n", '6')
+        owner = ctx.fs.user_with_primary_gid(group.gid)
+        if owner:
+            return ResponsePlan(
+                'command_output',
+                f"groupdel: cannot remove the primary group of user '{owner}'\n", '8')
+        ctx.fs.groups.remove(groupname)
         ctx.fs.refresh_etc()
         return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_usermod(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'usermod':
+        args = ctx.args
+        append = any(a.startswith('-') and 'a' in a[1:] for a in args)
+        groups_val = None
+        operands: list = []
+        skip = False
+        for i, a in enumerate(args):
+            if skip:
+                skip = False
+                continue
+            if a.startswith('-') and 'G' in a:
+                if i + 1 < len(args):
+                    groups_val = args[i + 1]
+                    skip = True
+                continue
+            if a.startswith('-'):
+                continue
+            operands.append(a)
+        if not operands:
+            return ResponsePlan('command_not_found', 'usermod: no options\n', '1')
+        username = operands[0]
+        user = ctx.fs.users.get(username)
+        if user is None:
+            return ResponsePlan('command_not_found',
+                                f"usermod: user '{username}' does not exist\n", '6')
+        if groups_val is None:
+            return ResponsePlan('command_output', 'usermod: no changes\n', '0')
+        gnames = [g for g in groups_val.split(',') if g]
+        for g in gnames:
+            if not ctx.fs.groups.exists(g):
+                return ResponsePlan('command_not_found',
+                                    f"usermod: group '{g}' does not exist\n", '6')
+        if not append:
+            ctx.fs.groups.remove_member_everywhere(username)
+        for g in gnames:
+            # A primary group is in /etc/passwd, never in /etc/group members.
+            if ctx.fs.groups.gid(g) != user.gid:
+                ctx.fs.groups.add_user_to_group(username, g)
+        ctx.fs.refresh_etc()
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_groups(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'groups':
+        # `groups alice` names the user; bare `groups` names the login user.
+        asked = _operands(ctx.args)
+        uname = asked[0] if asked else _login_username(ctx)
+        u = ctx.fs.users.get(uname)
+        if u is None:
+            if asked:
+                return ResponsePlan('command_not_found',
+                                    f"groups: '{uname}': no such user\n", '1')
+            return ResponsePlan('command_output', 'root', '0')
+        names = _group_names_for(ctx.fs, uname, u.gid)
+        if asked:
+            return ResponsePlan('command_output', f"{uname} : {' '.join(names)}", '0')
+        return ResponsePlan('command_output', ' '.join(names), '0')
     return None
 
 
@@ -870,8 +1025,10 @@ _ROUTES: tuple = (
     _cmd_mv,
     _cmd_useradd,
     _cmd_userdel,
+    _cmd_usermod,
     _cmd_groupadd,
     _cmd_groupdel,
+    _cmd_groups,
     _cmd_env,
     _cmd_printenv,
     _cmd_tee,
