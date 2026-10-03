@@ -7,6 +7,7 @@ from shared.response_engine import (
     decide_response,
     has_shell_syntax,
 )
+from shared.shell_state import VirtualShellState
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
@@ -32,6 +33,17 @@ class FakeSSHShell:
         # SAFETY: No real file access — uses FakeFilesystem
         self.fs = FakeFilesystem()
         self.current_dir = "/root"
+        self.shell_state = VirtualShellState(
+            user=self.username or "root",
+            uid=0,
+            gid=0,
+            groups=frozenset([0]),
+            cwd="/root",
+            old_pwd="/",
+            home="/root",
+            shell="/bin/bash",
+            term="xterm-256color",
+        )
         # The honeypot always presents a root shell; only whoami reflects the
         # actual login user (per session-isolation report recommendation).
         self.prompt = prompt_for(self.current_dir)
@@ -100,6 +112,7 @@ class FakeSSHShell:
                 {"args": args, "cwd": self.current_dir},
                 self.fs,
                 username=self.username,
+                shell_state=self.shell_state,
             )
             self._apply_cwd(new_cwd)
         else:
@@ -110,6 +123,7 @@ class FakeSSHShell:
                 {"args": args, "cwd": self.current_dir},
                 self.fs,
                 username=self.username,
+                shell_state=self.shell_state,
             )
 
         if response.response_type == "session_end":
@@ -134,8 +148,13 @@ class FakeSSHShell:
 
     def _apply_cwd(self, new_cwd: str) -> None:
         if new_cwd != self.current_dir:
+            old_cwd = self.current_dir
             self.current_dir = new_cwd
             self.prompt = prompt_for(self.current_dir)
+            self.shell_state.cwd = new_cwd
+            self.shell_state.old_pwd = old_cwd
+            self.shell_state.set_env('PWD', new_cwd)
+            self.shell_state.set_env('OLDPWD', old_cwd)
 
     def _handle_cd(self, cmd: str, mitre: dict) -> bool:
         """Perform `cd`; returns False when the move failed (already reported)."""

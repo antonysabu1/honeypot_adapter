@@ -374,6 +374,36 @@ class FakeFilesystem:
             parent = parent.children[p]
         return parent, parts[-1]
 
+    # ── structural lookups used by the permission policy ────────────────
+
+    def resolve(self, path: str) -> Inode | None:
+        """Public inode lookup (``None`` when any component is missing)."""
+        return self._resolve(path)
+
+    def parent_of(self, path: str) -> tuple[Inode, str] | None:
+        """Public parent lookup: ``(parent_inode, basename)`` or ``None``."""
+        return self._parent(path)
+
+    def resolve_chain(self, path: str) -> list[Inode] | None:
+        """Inodes from the root down to ``path`` (inclusive).
+
+        ``None`` if any component is missing or not a directory, so callers can
+        walk every ancestor to apply search (``x``) permission.
+        """
+        chain = [self._root]
+        node = self._root
+        for p in self._split(path):
+            if not node.is_dir or p == ".." or p not in node.children:
+                return None
+            node = node.children[p]
+            chain.append(node)
+        return chain
+
+    def dirname_of(self, path: str) -> str:
+        """Directory part of a path, ``/`` for top-level entries."""
+        parts = self._split(path)
+        return "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+
     # ── initial tree ─────────────────────────────────────────────────────
 
     def _init_tree(self) -> None:

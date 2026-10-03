@@ -7,6 +7,7 @@ from shared.response_engine import (
     decide_response,
     has_shell_syntax,
 )
+from shared.shell_state import VirtualShellState
 from shared.shell import (
     POST_LOGIN_BANNER,
     parse_args,
@@ -27,6 +28,17 @@ class TelnetSession:
         self.username = ""
         self.password = ""
         self.current_dir = "/root"
+        self.shell_state = VirtualShellState(
+            user=self.username or "root",
+            uid=0,
+            gid=0,
+            groups=frozenset([0]),
+            cwd="/root",
+            old_pwd="/",
+            home="/root",
+            shell="/bin/bash",
+            term="xterm-256color",
+        )
         self.prompt = prompt_for(self.current_dir)
         self.buffer = b""
         self._iac_buf = b""  # leftover bytes of a partial IAC sequence
@@ -165,6 +177,7 @@ class TelnetSession:
                     {"args": args, "cwd": self.current_dir},
                     self.fs,
                     username=self.username or "root",
+                    shell_state=self.shell_state,
                 )
                 if new_cwd != self.current_dir:
                     self.current_dir = new_cwd
@@ -177,6 +190,7 @@ class TelnetSession:
                     {"args": args, "cwd": self.current_dir},
                     self.fs,
                     username=self.username or "root",
+                    shell_state=self.shell_state,
                 )
 
             if response.response_type == "session_end":

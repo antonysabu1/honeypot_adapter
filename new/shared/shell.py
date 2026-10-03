@@ -9,6 +9,8 @@ own line handling, or the SSH transports' cd logging.
 import os
 from dataclasses import dataclass
 
+from shared.permissions import X, check
+
 LOGIN_BANNER = "\r\nWelcome to Ubuntu 22.04 LTS\r\n\r\n"
 
 POST_LOGIN_BANNER = (
@@ -61,12 +63,13 @@ class CdResult:
         return self.error is None
 
 
-def resolve_cd(target: str, cwd: str, fs) -> CdResult:
+def resolve_cd(target: str, cwd: str, fs, identity=None) -> CdResult:
     """Resolve a `cd` target against the fake filesystem.
 
     The cwd is left unchanged when the move fails and `error` is the exact bash
     message to show. Callers keep their own output sink, prompt and logging —
-    this is only the policy.
+    this is only the policy.  When ``identity`` is supplied, entering the
+    directory requires execute (search) permission on it and its ancestors.
     """
     path = target or "/root"
     if not path.startswith("/"):
@@ -76,6 +79,8 @@ def resolve_cd(target: str, cwd: str, fs) -> CdResult:
         return CdResult(cwd, path, f"bash: cd: {path}: No such file or directory")
     if not fs.is_dir(normalized):
         return CdResult(cwd, path, f"bash: cd: {path}: Not a directory")
+    if identity is not None and not check(fs, normalized, identity, X):
+        return CdResult(cwd, path, f"bash: cd: {path}: Permission denied")
     return CdResult(normalized, path)
 
 

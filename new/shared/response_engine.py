@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase, valid_name
 from shared.config import get_attr
+from shared.permissions import identity_for
+from shared.shell_state import VirtualShellState
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
     FILTERS,
@@ -43,6 +45,8 @@ class _Ctx:
     cwd: str
     fs: FakeFilesystem
     username: str
+    identity: str
+    shell_state: "VirtualShellState | None" = None
 
 def _cmd_ls(ctx: _Ctx) -> ResponsePlan | None:
     # exact base, so lscpu/lsblk/lsof fall through to their own handlers
@@ -112,7 +116,7 @@ def _cmd_view(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_pwd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd == 'pwd':
-        return ResponsePlan('command_output', ctx.cwd, '0')
+        return ResponsePlan('command_output', ctx.shell_state.cwd, '0')
     return None
 
 def _cmd_whoami(ctx: _Ctx) -> ResponsePlan | None:
@@ -130,7 +134,27 @@ def _cmd_uname(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_cd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.cmd == 'cd' or ctx.cmd.startswith('cd '):
-        return ResponsePlan('command_output', '', '0')
+        target = ctx.cmd.split(' ', 1)[1] if len(ctx.cmd.split(' ', 1)) > 1 else ''
+        if target == '-':
+            # cd -: change to previous working directory
+            old_pwd = ctx.shell_state.env_var('OLDPWD', '/')
+            if not ctx.fs.exists(old_pwd):
+                return ResponsePlan('command_output',
+                                    f"bash: cd: error retrieving OLDPWD\n", '1')
+            ctx.shell_state.cwd = old_pwd
+            ctx.shell_state.set_env('PWD', old_pwd)
+            ctx.shell_state.set_env('OLDPWD', ctx.cwd)
+            return ResponsePlan('command_output', '', '0')
+        result = resolve_cd(target, ctx.cwd, ctx.fs, ctx.identity)
+        if result.ok:
+            new_cwd = result.cwd
+            old_cwd = ctx.cwd
+            ctx.shell_state.cwd = new_cwd
+            ctx.shell_state.old_pwd = old_cwd
+            ctx.shell_state.set_env('PWD', new_cwd)
+            ctx.shell_state.set_env('OLDPWD', old_cwd)
+            return ResponsePlan('command_output', '', '0')
+        return ResponsePlan('command_output', result.path, '1')
     return None
 
 def _cmd_exit(ctx: _Ctx) -> ResponsePlan | None:
@@ -812,7 +836,27 @@ def _cmd_useradd(ctx: _Ctx) -> ResponsePlan | None:
         uid = ctx.fs.users.uid(username)
         gid = uid if not ctx.fs.groups.gid_in_use(uid) else ctx.fs.groups.next_gid()
         ctx.fs.groups.add(username, gid=gid)
+        # ── New: create home directory in the virtual filesystem ──
+        if home:
+            hpath = home
+        else:
+            hpath = f"/home/{username}"
+        if not ctx.fs.exists(hpath):
+            ctx.fs.mkdir(hpath)
+            # Set ownership to the new user
+            ctx.fs.chown(hpath, uid=uid, gid=gid)
+        # ── end new ────────────────────────────────────────────
         ctx.fs.refresh_etc()
+        # ── New: update session shell state if available ──
+        if ctx.shell_state is not None:
+            ctx.shell_state.user = username
+            ctx.shell_state.uid = uid
+            ctx.shell_state.gid = gid
+            ctx.shell_state.home = hpath
+            members = ctx.fs.groups.memberships_for(username)
+        members_set = set(members) if not isinstance(members, set) else members
+        ctx.shell_state.groups = frozenset({gid} | members_set)
+        # ── end new ────────────────────────────────────────────
         return ResponsePlan('command_output', '', '0')
     return None
 
@@ -988,6 +1032,34 @@ def _cmd_printenv(ctx: _Ctx) -> ResponsePlan | None:
         return ResponsePlan('command_output', val + '\n', '0')
     return None
 
+
+def _cmd_export(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'export':
+        if not ctx.args:
+            # No arguments: print all exported variables
+            lines = [f"export {k}={v}" for k, v in sorted(_ENV.items())]
+            return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
+        # Set a variable as exported (same as assignment in bash)
+        key = ctx.args[0]
+        if '=' in key:
+            key, value = key.split('=', 1)
+            ctx.shell_state.set_env(key, value)
+        else:
+            # Variable name only - mark it as exported (no value change)
+            ctx.shell_state.set_env(key, _ENV.get(key, ''))
+        return ResponsePlan('command_output', '', '0')
+    return None
+
+
+def _cmd_unset(ctx: _Ctx) -> ResponsePlan | None:
+    if ctx.base == 'unset':
+        if not ctx.args:
+            return ResponsePlan('command_output', '', '1')
+        for key in ctx.args:
+            ctx.shell_state.unset_env(key)
+        return ResponsePlan('command_output', '', '0')
+    return None
+
 _ROUTES: tuple = (
     _cmd_ls,
     _cmd_cat,
@@ -1031,6 +1103,8 @@ _ROUTES: tuple = (
     _cmd_groups,
     _cmd_env,
     _cmd_printenv,
+    _cmd_export,
+    _cmd_unset,
     _cmd_tee,
     _cmd_cal,
     _cmd_dd,
@@ -1079,6 +1153,7 @@ def decide_response(
     parameters: dict,
     fs: FakeFilesystem,
     username: str = "root",
+    shell_state: "VirtualShellState | None" = None,
 ) -> ResponsePlan:
     """Answer ONE command; `protocol`/`session_id` are accepted for callers.
 
@@ -1086,13 +1161,27 @@ def decide_response(
     a single command can be read and changed without scanning the rest.
     """
     cmd = action.strip()
+    if shell_state is None:
+        shell_state = VirtualShellState(
+            user=username,
+            uid=0,
+            gid=0,
+            groups=frozenset([0]),
+            cwd=parameters.get('cwd', '/'),
+            old_pwd='/',
+            home='/root',
+            shell='/bin/bash',
+            term='xterm-256color',
+        )
     ctx = _Ctx(
         cmd=cmd,
-        base=cmd.split()[0] if cmd else "",
-        args=parameters.get("args", []),
-        cwd=parameters.get("cwd", "/"),
+        base=cmd.split()[0] if cmd else '',
+        args=parameters.get('args', []),
+        cwd=parameters.get('cwd', '/'),
         fs=fs,
         username=username,
+        identity=identity_for(fs, username),
+        shell_state=shell_state,
     )
     for handler in _ROUTES:
         plan = handler(ctx)
