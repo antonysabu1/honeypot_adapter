@@ -42,6 +42,7 @@ def _get_max_total_sessions() -> int:
 # Global tracking instances — initialised when first used
 _ip_sessions: dict[str, int] = defaultdict(int)  # ip → session count
 _protocol_sessions: dict[str, int] = defaultdict(int)  # protocol → session count
+_session_command_counts: dict[str, int] = defaultdict(int)  # session_id → command count
 _session_timestamps: dict[str, float] = defaultdict(float)  # ip → last activity
 
 
@@ -54,6 +55,23 @@ def _init() -> None:
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
+
+def _get_session_command_count(session_id: str) -> int:
+    """Return the current command count for *session_id*."""
+    return _session_command_counts.get(session_id, 0)
+
+
+def _increment_session_command_count(session_id: str) -> None:
+    """Increment the command counter for *session_id*."""
+    _session_command_counts[session_id] = _session_command_counts.get(session_id, 0) + 1
+
+
+def _check_session_command_limit(session_id: str) -> bool:
+    """Return True if the session has not yet reached max_commands_per_session."""
+    from shared.config import get
+    max_cmds = get("limits.max_commands_per_session", 500)
+    return _get_session_command_count(session_id) < max_cmds
+
 
 def can_create_session(protocol: str, source_ip: str) -> bool:
     """Check whether a new session can be created given current limits.
@@ -101,13 +119,21 @@ def unregister_session(protocol: str, source_ip: str) -> None:
 
 
 def _refresh_timestamps() -> None:
-    """Optionally prune stale IP entries based on session_timeout."""
+    """Prune stale IP entries based on session_timeout.
+
+    IP entries that have not had activity within the configured session_timeout
+    window have their per-IP session counters reset, allowing new sessions from
+    those IPs.  Global and per-protocol counters are unaffected.
+    """
     from shared.config import get
     now = time.time()
     timeout = get("limits.session_timeout", 3600)
-    # Simple prune: IPs with no recent activity can have their counters reset
-    # This is optional and depends on deployment; keep it minimal for now.
-    pass
+    expired_ips = [
+        ip for ip, last_seen in _session_timestamps.items()
+        if now - last_seen > timeout
+    ]
+    for ip in expired_ips:
+        _ip_sessions[ip] = 0
 
 
 # ── Convenience ────────────────────────────────────────────────────────────

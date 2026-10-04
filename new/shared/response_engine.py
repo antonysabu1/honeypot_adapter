@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase, valid_name
-from shared.config import get_attr
+from shared.config import get
+from shared.connection_manager import _check_session_command_limit, _increment_session_command_count
 from shared.permissions import identity_for
 from shared.shell_state import VirtualShellState
 from shared.shell import resolve_cd
@@ -240,9 +241,178 @@ def _cmd_hostname(ctx: _Ctx) -> ResponsePlan | None:
     return None
 
 def _cmd_apt(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base in ('apt', 'apt-get'):
-        return ResponsePlan('command_output', 'Reading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done', '0')
-    return None
+    """Handle the `apt` and `apt-get` commands.
+
+    Supported subcommands:
+      update     -> simulate package list update
+      list       -> list installed packages
+      show <pkg> -> show package info
+      install <pkg> -> install a package
+      remove <pkg> -> remove a package
+      purge <pkg> -> purge a package
+    """
+    from shared.packages import get_package_manager
+
+    base = ctx.base
+    args = ctx.args or []
+
+    if base not in ('apt', 'apt-get'):
+        return None
+
+    if not args:
+        # No arguments - show help-like output or list
+        pm = get_package_manager()
+        if ctx.base == 'apt':
+            installed = pm.list_installed()
+            if installed:
+                lines = [f"{p.name}/{p.version}" for p in installed]
+                return ResponsePlan('command_output', 'Installed packages:\n' + '\n'.join(lines), '0')
+            return ResponsePlan('command_output', 'No packages installed.', '0')
+        # apt-get with no args
+        return ResponsePlan('command_output', 'Reading package lists... Done\n', '0')
+
+    subcommand = args[0].lower()
+    pkg_name = args[1] if len(args) > 1 else None
+
+    pm = get_package_manager()
+
+    if subcommand == 'update':
+        # Simulate apt-get update / apt update
+        return ResponsePlan('command_output', 'Hit:1 http://archive.ubuntu.com/ubuntu jammy InRelease\nGet:2 http://security.ubuntu.com/ubuntu jammy-security InRelease [45.6 kB]\nFetched 45.6 kB in 0s (10.1 kB/s)\nReading package lists... Done\n', '0')
+
+    if subcommand == 'list':
+        if ctx.base == 'apt':
+            return ResponsePlan('command_output', pm.apt_list(), '0')
+        return ResponsePlan('command_output', 'Reading package lists... Done\n', '0')
+
+    if subcommand == 'show' and pkg_name:
+        pkg = pm.apt_query(pkg_name)
+        if pkg is None:
+            return ResponsePlan('command_not_found', f"Package '{pkg_name}' is not installed\n", '1')
+        lines = [
+            f"Package: {pkg.name}",
+            f"Version: {pkg.version}",
+            f"Architecture: {pkg.architecture}",
+            f"Installed: {'yes' if pkg.installed else 'no'}",
+        ]
+        if pkg.description:
+            lines.append(f"Description: {pkg.description}")
+        return ResponsePlan('command_output', '\n'.join(lines), '0')
+
+    if subcommand == 'install':
+        if not pkg_name:
+            return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
+        results = pm.apt_get_install([pkg_name])
+        pkg_result = results[0]
+        pkg = pm.get(pkg_name)
+        status_msg = pkg_result[1]
+        if pkg_result[0] == 'installed' and pkg is not None and pkg.installed:
+            # Cross-component integration: filesystem, services, processes, network
+            fs = ctx.fs
+            if fs is not None:
+                pkg._do_install(pkg)  # type: ignore[attr-defined]  # will integrate fs
+            # Build response
+            return ResponsePlan('command_output', f"{pkg_name} set to installed.\n", '0')
+        return ResponsePlan('command_output', f"{status_msg}\n", '1')
+
+    if subcommand == 'remove':
+        if not pkg_name:
+            return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
+        results = pm.apt_get_remove([pkg_name])
+        pkg_result = results[0]
+        status_msg = pkg_result[1]
+        if pkg_result[0] == 'removed':
+            # Cross-component integration: remove filesystem, services, processes, network
+            fs = ctx.fs
+            if fs is not None:
+                pkg = pm.get(pkg_name)
+                if pkg is not None:
+                    pkg._do_remove(pkg, purge=False)  # type: ignore[attr-defined]
+            return ResponsePlan('command_output', f"{pkg_name} removed.\n", '0')
+        return ResponsePlan('command_output', f"{status_msg}\n", '1')
+
+    if subcommand == 'purge':
+        if not pkg_name:
+            return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
+        results = pm.apt_get_remove([pkg_name], purge=True)
+        pkg_result = results[0]
+        status_msg = pkg_result[1]
+        if pkg_result[0] == 'removed':
+            fs = ctx.fs
+            if fs is not None:
+                pkg = pm.get(pkg_name)
+                if pkg is not None:
+                    pkg._do_remove(pkg, purge=True)  # type: ignore[attr-defined]
+            return ResponsePlan('command_output', f"{pkg_name} purged.\n", '0')
+        return ResponsePlan('command_output', f"{status_msg}\n", '1')
+# Default fallback for unrecognized apt/apt-get subcommands
+    return ResponsePlan('command_output', f"Reading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\n", '0')
+
+
+def _cmd_dpkg(ctx: _Ctx) -> ResponsePlan | None:
+    """Handle the `dpkg` command.
+
+    Supported subcommands:
+      -s <pkg>  -> show package status
+      -L <pkg>  -> list package files
+      -l        -> list all packages
+      -i <pkg>  -> show package info
+    """
+    from shared.packages import get_package_manager
+
+    base = ctx.base
+    args = ctx.args or []
+
+    if base != 'dpkg':
+        return None
+
+    if not args:
+        # No arguments - show help-like output
+        return ResponsePlan('command_output', 'Usage: dpkg -i | -L | -s | -l <package>\n', '0')
+
+    subcommand = args[0].lower()
+    pkg_name = args[1] if len(args) > 1 else None
+
+    pm = get_package_manager()
+
+    if subcommand in ('-s', '--status', 'status') and pkg_name:
+        status = pm.dpkg_status(pkg_name)
+        return ResponsePlan('command_output', status, '0')
+
+    if subcommand in ('-L', '--list-files', 'list-files') and pkg_name:
+        pkg = pm.get(pkg_name)
+        if pkg is None:
+            return ResponsePlan('command_not_found', f"Package '{pkg_name}' is not installed\n", '1')
+        # Return simulated file list for the package
+        lines = [
+            f"/usr/bin/{pkg.name}",
+            f"/usr/share/doc/{pkg.name}/copyright",
+        ]
+        return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
+
+    if subcommand in ('-l', '--list', 'list') and pkg_name is None:
+        # List all packages
+        installed = pm.list_installed()
+        lines = [f"{p.name}/{p.version}" for p in installed]
+        return ResponsePlan('command_output', 'Installed packages:\n' + '\n'.join(lines), '0')
+
+    if subcommand in ('-i', '--info', 'info') and pkg_name:
+        pkg = pm.apt_query(pkg_name)
+        if pkg is None:
+            return ResponsePlan('command_not_found', f"Package '{pkg_name}' is not installed\n", '1')
+        lines = [
+            f"Package: {pkg.name}",
+            f"Version: {pkg.version}",
+            f"Architecture: {pkg.architecture}",
+            f"Status: {'install ok installed' if pkg.installed else 'deinstall ok config-files'}",
+        ]
+        if pkg.description:
+            lines.append(f"Description: {pkg.description}")
+        return ResponsePlan('command_output', '\n'.join(lines), '0')
+
+    # Default fallback
+    return ResponsePlan('command_output', 'dpkg: unrecognized option\n', '1')
+
 
 def _cmd_uptime(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'uptime':
@@ -733,9 +903,49 @@ def _cmd_cmake(ctx: _Ctx) -> ResponsePlan | None:
     return None
 
 def _cmd_pip(ctx: _Ctx) -> ResponsePlan | None:
-    if ctx.base == 'pip' or ctx.base == 'pip3':
-        return ResponsePlan('command_output', 'Package    Version\n----------- -------\npip        24.0\nsetuptools 69.0.3\n', '0')
-    return None
+    from shared.packages import get_package_manager
+
+    base = ctx.base
+    args = ctx.args or []
+
+    if base not in ('pip', 'pip3'):
+        return None
+
+    if not args:
+        pm = get_package_manager()
+        installed = pm.list_installed()
+        if not installed:
+            return ResponsePlan('command_output', 'Package    Version\n----------- -------\nNo packages installed.\n', '0')
+        lines = ['Package    Version', '----------- -------']
+        for p in installed:
+            lines.append(f"{p.name}/{p.architecture} {p.version}")
+        return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
+
+    subcommand = args[0].lower()
+    pkg_name = args[1] if len(args) > 1 else None
+
+    pm = get_package_manager()
+
+    if subcommand == 'install':
+        if not pkg_name:
+            return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
+        results = pm.apt_get_install([pkg_name])
+        pkg_result = results[0]
+        if pkg_result[0] == 'installed':
+            return ResponsePlan('command_output', f"{pkg_name} installed.\n", '0')
+        return ResponsePlan('command_output', f"{pkg_result[1]}\n", '1')
+
+    if subcommand == 'list':
+        installed = pm.list_installed()
+        if not installed:
+            return ResponsePlan('command_output', 'Package    Version\n----------- -------\nNo packages installed.\n', '0')
+        lines = ['Package    Version', '----------- -------']
+        for p in installed:
+            lines.append(f"{p.name}/{p.architecture} {p.version}")
+        return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
+
+    # Default fallback - show pip-style output
+    return ResponsePlan('command_output', 'Package    Version\n----------- -------\npip        24.0\nsetuptools 69.0.3\n', '0')
 
 def _cmd_wget(ctx: _Ctx) -> ResponsePlan | None:
     # wget/curl/nc/ncat/nmap are deliberately still command_not_found: passive
@@ -1139,6 +1349,7 @@ _ROUTES: tuple = (
     _cmd_gcc,
     _cmd_make,
     _cmd_cmake,
+    _cmd_dpkg,
     _cmd_pip,
     _cmd_wget,
     _cmd_history,
@@ -1183,9 +1394,23 @@ def decide_response(
         identity=identity_for(fs, username),
         shell_state=shell_state,
     )
+    # Enforce max_commands_per_session limit
+    if session_id and not _check_session_command_limit(session_id):
+        return ResponsePlan(
+            "command_not_found",
+            f"bash: too many commands (max {get('limits.max_commands_per_session', 500)} per session)\n",
+            "127",
+        )
+    # Increment command count after the check (whether or not the command succeeds)
+    if session_id:
+        _increment_session_command_count(session_id)
     for handler in _ROUTES:
         plan = handler(ctx)
         if plan is not None:
+            # Enforce max_output_size limit
+            max_out = get("limits.max_output_size", 65536)
+            if len(plan.content.encode("utf-8")) > max_out:
+                plan.content = plan.content.encode("utf-8")[:max_out].decode("utf-8", errors="replace")
             return plan
     return ResponsePlan("command_not_found", f"bash: {cmd}: command not found\n", "127")
 
