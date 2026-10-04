@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS attack_techniques (
 );
 """
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -124,8 +124,22 @@ class StorageEngine:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
-        # Migrate: copy existing JSONL → SQLite if DB was just created
+        # Verify integrity immediately after schema initialisation.
+        self._verify_integrity()
+        # Migrate: best-effort import of existing JSONL into SQLite.
+        # Corrupt lines are skipped; startup never fails because of migration.
         self._migrate_jsonl()
+
+    def _verify_integrity(self) -> None:
+        """Run PRAGMA integrity_check; raise RuntimeError on corruption."""
+        try:
+            row = self._conn.execute("PRAGMA integrity_check").fetchone()
+            if row[0] != "ok":
+                raise RuntimeError(f"SQLite integrity check failed: {row[0]}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"SQLite integrity check error: {exc}") from exc
 
     def _close(self) -> None:
         if self._conn:
@@ -133,7 +147,11 @@ class StorageEngine:
             self._conn = None
 
     def _migrate_jsonl(self) -> None:
-        """Best-effort import of existing JSONL into SQLite."""
+        """Best-effort import of existing JSONL into SQLite.
+
+        Corrupt lines (bad JSON, missing mandatory fields) are silently
+        skipped so that a broken log file never prevents startup.
+        """
         if not JSONL_PATH.exists():
             return
         try:
@@ -144,7 +162,11 @@ class StorageEngine:
                         continue
                     try:
                         e = json.loads(line)
-                        # Minimal fields; missing ones stay NULL
+                        # Minimal required fields for the events table.
+                        mandatory = ("event_id", "timestamp", "session_id",
+                                     "protocol", "action", "response_type", "status")
+                        if not all(k in e for k in mandatory):
+                            continue
                         eid = e.get("event_id") or _uuid()
                         ts = e.get("timestamp") or _now_iso()
                         sid = e.get("session_id") or ""
@@ -167,13 +189,15 @@ class StorageEngine:
                             (eid, ts, sid, proto, action, params, rtype, status,
                              mitre, mitre_name, mitre_tactic, mitre_sec),
                         )
-                    except (json.JSONDecodeError, KeyError):
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        # Skip this line; do not abort migration.
                         continue
             self._conn.commit()
         except Exception:
-            pass  # migration is best-effort; do not break startup
+            # Best-effort only; never break honeypot startup.
+            pass
 
-    # ── context manager ────────────────────────────────────────────────────
+    # ── context manager ───────────────────────────────────────────────────
 
     def __enter__(self):
         return self
@@ -367,9 +391,65 @@ class StorageEngine:
         rows = self.fetch_all("SELECT * FROM events")
         with open(out, "w", encoding="utf-8") as f:
             for row in rows:
-                # Build a clean dict without the SQL rowid
+                # Build a clean dict without the SQL rowid; keep NULLs as null.
                 d = {k: v for k, v in row.items() if v is not None}
                 f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+    # ── session reconstruction queries ─────────────────────────────────────
+
+    def fetch_session_events(self, session_id: str) -> list[dict]:
+        """Return all telemetry events for *session_id* ordered by timestamp."""
+        return self.fetch_all(
+            "SELECT * FROM events WHERE session_id=? ORDER BY timestamp",
+            (session_id,),
+        )
+
+    def fetch_session_auth_attempts(self, session_id: str) -> list[dict]:
+        """Return all authentication attempts for *session_id* ordered by timestamp."""
+        return self.fetch_all(
+            "SELECT * FROM authentication_attempts WHERE session_id=? ORDER BY timestamp",
+            (session_id,),
+        )
+
+    def fetch_recent_events(self, limit: int = 50) -> list[dict]:
+        """Return the *limit* most recent events across all sessions."""
+        return self.fetch_all(
+            "SELECT * FROM events ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        )
+
+    def fetch_events_by_action(self, action: str) -> list[dict]:
+        """Return all events whose *action* matches (case-sensitive)."""
+        return self.fetch_all(
+            "SELECT * FROM events WHERE action=? ORDER BY timestamp",
+            (action,),
+        )
+
+    def fetch_sessions_by_source_ip(self, source_ip: str) -> list[dict]:
+        """Return all session records originating from *source_ip*."""
+        return self.fetch_all(
+            "SELECT * FROM sessions WHERE source_ip=? ORDER BY started_at",
+            (source_ip,),
+        )
+
+    def fetch_correlation_data(self, session_id: str) -> dict | None:
+        """Return a payload useful for reconstructing an attacker session.
+
+        Contains the session record, its events, and any auth attempts —
+        everything a downstream analyst would need to understand a single
+        honeypot interaction without touching the live container.
+        """
+        session = self.fetch_one("SELECT * FROM sessions WHERE session_id=?",
+                                 (session_id,))
+        if not session:
+            return None
+        events = self.fetch_session_events(session_id)
+        auth_attempts = self.fetch_session_auth_attempts(session_id)
+        return {
+            "session": session,
+            "events": events,
+            "auth_attempts": auth_attempts,
+        }
 
     # ── retention / rotation ───────────────────────────────────────────────
 
@@ -377,7 +457,8 @@ class StorageEngine:
         """Remove sessions and associated data older than *days*."""
         from datetime import timedelta
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        # Delete orphan events first (FK cascade handles it with ON DELETE)
+        # Delete orphan events first (FK cascade handles it with ON DELETE).
+        # SQLite WAL mode guarantees this is safe even with concurrent readers.
         self._conn.execute("DELETE FROM events WHERE timestamp < ?", (cutoff,))
         self._conn.execute(
             "DELETE FROM sessions WHERE started_at < ?", (cutoff,)
@@ -385,7 +466,24 @@ class StorageEngine:
         self._conn.commit()
         return self._conn.total_changes
 
+    # ── resilience ─────────────────────────────────────────────────────────
 
+    def reset_for_testing(self) -> None:
+        """Close and delete the DB file so it can be recreated from scratch."""
+        try:
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+        except Exception:
+            pass
+        try:
+            if self._db_path.exists():
+                self._db_path.unlink()
+        except OSError:
+            pass
 # ── Global instance ──────────────────────────────────────────────────────────
 
 _storage: StorageEngine | None = None

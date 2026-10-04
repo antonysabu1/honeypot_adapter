@@ -18,6 +18,12 @@ REQUIRED_KEYS = (
     "session_source",
     "response_status",
     "response_type",
+    "mitre_attack_id",
+    "mitre_technique_name",
+    "mitre_tactic",
+    "mitre_attack_id_secondary",
+    "mitre_technique_name_secondary",
+    "mitre_confidence",
 )
 
 
@@ -29,7 +35,13 @@ def _max_log_size_bytes() -> int:
 
 
 def _prune_log() -> None:
-    """Trim the log file if it exceeds the configured maximum size."""
+    """Trim the log file if it exceeds the configured maximum size.
+
+    Uses an atomic write (write to temp file, then rename) so that a
+    power failure or signal during pruning never leaves the log in an
+    inconsistent state.  Malformed lines are skipped rather than
+    causing the entire prune to fail.
+    """
     max_bytes = _max_log_size_bytes()
     if not LOG_FILE.exists():
         return
@@ -37,19 +49,45 @@ def _prune_log() -> None:
     if size <= max_bytes:
         return
     # Read all lines, keep only the most recent ones that fit under the limit
-    with LOG_FILE.open("r", encoding="utf-8") as f:
-        lines = f.readlines()
-    # Truncate from the front, keeping the most recent entries
+    good: list[str] = []
     total = 0
-    kept: list[str] = []
-    for line in reversed(lines):
-        total += len(line.encode("utf-8"))
-        if total > max_bytes:
-            break
-        kept.append(line)
-    kept.reverse()
-    with LOG_FILE.open("w", encoding="utf-8") as f:
-        f.writelines(kept)
+    with LOG_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            try:
+                evt = json.loads(line)
+                # Verify minimum structure; skip truly corrupt lines.
+                for k in ("event_id", "timestamp", "action"):
+                    if k not in evt:
+                        raise ValueError("missing required field")
+            except (json.JSONDecodeError, ValueError):
+                # Corrupt line — drop it to protect the overall log integrity.
+                continue
+            line_bytes = len(line.encode("utf-8")) + 1  # +1 for "\n"
+            if total + line_bytes > max_bytes:
+                break
+            good.append(line + "\n")
+            total += line_bytes
+    # Atomic rewrite: write to a temp file in the same directory, then rename.
+    # This prevents a crash / power-loss from leaving the log truncated or
+    # empty (the original file is only replaced after the new content is fully
+    # written and flushed).
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(LOG_FILE.parent), suffix=".jsonl.tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp:
+            tmp.writelines(good)
+        os.replace(tmp_path, str(LOG_FILE))
+    except BaseException:
+        # If anything goes wrong, discard the temp file; the original log
+        # remains untouched so no data is lost.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def log_event(event_dict: dict) -> None:
@@ -59,11 +97,23 @@ def log_event(event_dict: dict) -> None:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event_dict, ensure_ascii=False) + "\n")
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event_dict, ensure_ascii=False) + "\n")
+    except (OSError, BrokenError) as exc:
+        # Telemetry failure must never execute attacker code or mutate
+        # VirtualOS state; we simply log to stderr and return so the
+        # honeypot continues operating without telemetry for this event.
+        print(f"telemetry write failure: {exc}", flush=True)
+        return
 
-    # Enforce maximum log size
-    _prune_log()
+    # Enforce maximum log size (atomic prune; cannot raise)
+    try:
+        _prune_log()
+    except Exception:
+        # Prune failure must also never mask a security event; ignore and
+        # keep the running honeypot functional.
+        print("telemetry prune failure", flush=True)
 
     print(
         f"[{str(event_dict['protocol']).upper()}] "
