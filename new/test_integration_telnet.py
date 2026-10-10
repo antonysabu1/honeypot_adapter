@@ -131,11 +131,28 @@ def main() -> None:
         assert "command_not_found" in resp_types, "no command_not_found event"
         assert "session_end" in resp_types, "no session_end event for exit"
         assert all(e["protocol"] == "telnet" for e in events), "non-telnet event found"
-        # Login events must carry MITRE keys (null for lifecycle, T1078 for auth).
+
+        # Adapter contract: exactly eleven top-level keys per event, and each
+        # interaction logged once (no "pending" placeholder event).
+        contract = {
+            "event_id", "timestamp", "protocol", "source_ip", "session_id",
+            "action", "parameters", "raw_metadata", "session_source",
+            "response_status", "response_type",
+        }
+        assert all(set(e) == contract for e in events), (
+            f"event schema is not the 11-key contract: {sorted(events[0])}"
+        )
+        assert "pending" not in resp_types, "duplicate 'pending' event logged"
+        # Login is logged exactly once, with its MITRE tag nested (not top-level).
         login_events = [e for e in events if e["action"] == "login_attempt"]
-        assert login_events and login_events[0]["mitre_attack_id"] == "T1078", (
+        assert len(login_events) == 1, f"expected 1 login_attempt, got {len(login_events)}"
+        assert login_events[0]["raw_metadata"]["mitre"]["mitre_attack_id"] == "T1078", (
             "login_attempt missing T1078 tag"
         )
+        counts = {a: actions.count(a) for a in set(actions)}
+        for action in ("connection_established", "login_attempt", "whoami",
+                       "hacked", "exit", "connection_closed"):
+            assert counts[action] == 1, f"{action} logged {counts[action]}x: {counts}"
 
         print("ALL TELNET INTEGRATION TESTS PASSED")
     finally:

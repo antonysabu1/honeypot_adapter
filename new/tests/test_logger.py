@@ -36,6 +36,9 @@ def main() -> None:
     parsed = json.loads(lines[0])
     for key in REQUIRED_KEYS:
         assert key in parsed, f"missing key in written event: {key}"
+    # The adapter contract is exactly eleven top-level fields.
+    assert len(REQUIRED_KEYS) == 11, f"contract must have 11 keys, got {len(REQUIRED_KEYS)}"
+    assert set(parsed) == set(REQUIRED_KEYS), f"unexpected schema: {sorted(parsed)}"
 
     incomplete = {k: v for k, v in SAMPLE_EVENT.items() if k != "action"}
     try:
@@ -44,6 +47,15 @@ def main() -> None:
         print(f"validation OK: {e}")
     else:
         raise AssertionError("log_event accepted an event with missing keys")
+
+    # A leaked top-level MITRE field must be rejected, not written.
+    extra = dict(SAMPLE_EVENT, mitre_attack_id="T1033")
+    try:
+        log_event(extra)
+    except ValueError as e:
+        print(f"extra-key rejection OK: {e}")
+    else:
+        raise AssertionError("log_event accepted an unauthorized top-level key")
 
     print("ALL TESTS PASSED")
 

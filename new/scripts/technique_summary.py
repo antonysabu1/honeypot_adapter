@@ -18,6 +18,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from shared.events import mitre_of
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG = PROJECT_ROOT / "logs" / "honeypot.jsonl"
 
@@ -81,7 +83,7 @@ def summarize(log_path, top, per_session):
     by_proto = defaultdict(Counter)
     total = 0
     for e in events:
-        tid = e.get("mitre_attack_id")
+        tid = mitre_of(e).get("mitre_attack_id")
         if not tid:
             continue
         proto = e.get("protocol", "?")
@@ -104,7 +106,7 @@ def summarize(log_path, top, per_session):
 def _print_per_session(events):
     session_techs = defaultdict(set)
     for e in events:
-        tid = e.get("mitre_attack_id")
+        tid = mitre_of(e).get("mitre_attack_id")
         sid = e.get("session_id")
         if tid and sid:
             session_techs[sid].add(tid)

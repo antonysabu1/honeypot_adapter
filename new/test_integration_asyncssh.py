@@ -156,11 +156,21 @@ async def run_asyncssh_tests():
 
         assert all(e["protocol"] == "ssh" for e in events), "non-ssh event found"
 
-        lifecycle = [e for e in events if e["action"] == "connection_established"]
-        assert lifecycle and "mitre_attack_id" in lifecycle[0], (
-            "connection_established missing MITRE keys"
+        # Adapter contract: exactly eleven top-level keys, each interaction once.
+        contract = {
+            "event_id", "timestamp", "protocol", "source_ip", "session_id",
+            "action", "parameters", "raw_metadata", "session_source",
+            "response_status", "response_type",
+        }
+        assert all(set(e) == contract for e in events), (
+            f"event schema is not the 11-key contract: {sorted(events[0])}"
         )
-        assert "pubkey_attempt" in actions, "missing pubkey_attempt event"
+        assert "pending" not in resp_types, "duplicate 'pending' event logged"
+        # conn1 + conn2 authenticate with a password; conn3 with a public key.
+        # A client may offer its key more than once, so pubkey_attempt is not
+        # pinned to an exact count - only that no "pending" duplicate appears.
+        assert actions.count("login_attempt") == 2, actions
+        assert "pubkey_attempt" in actions, actions
 
         print("ALL ASYNCSSH INTEGRATION TESTS PASSED")
         return True

@@ -1,22 +1,14 @@
 import socketserver
 import threading
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 # paramiko is a required third-party dependency. It is installed (v5.0.0).
 import paramiko
 
+from shared.events import build_event as _build_event
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
 from shared.connection_manager import can_create_session, register_session, unregister_session
-from ssh_adapter.shell import FakeSSHShell
-
-# paramiko is a required third-party dependency. It is installed (v5.0.0).
-import paramiko
-
-from shared.logger import log_event
-from shared.session import create_session_id, tracker as session_tracker
 from ssh_adapter.shell import FakeSSHShell
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
@@ -38,37 +30,6 @@ def _get_host_key() -> paramiko.RSAKey:
             _HOST_KEY = paramiko.RSAKey.generate(2048)
             _HOST_KEY.write_private_key_file(str(HOST_KEY_PATH))
     return _HOST_KEY
-
-
-def _build_event(
-    session_id,
-    source_ip,
-    protocol,
-    action,
-    parameters,
-    response_status,
-    response_type,
-) -> dict:
-    return {
-        "event_id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "protocol": protocol,
-        "source_ip": source_ip,
-        "session_id": session_id,
-        "action": action,
-        "parameters": parameters,
-        "raw_metadata": {},
-        "session_source": "protocol_native",
-        "response_status": response_status,
-        "response_type": response_type,
-        # Lifecycle events are not attacker commands, so MITRE fields are null.
-        "mitre_attack_id": None,
-        "mitre_technique_name": None,
-        "mitre_tactic": None,
-        "mitre_attack_id_secondary": None,
-        "mitre_technique_name_secondary": None,
-        "mitre_confidence": None,
-    }
 
 
 class HoneypotSSHServer(paramiko.ServerInterface):
@@ -188,25 +149,15 @@ class SSHHandler(socketserver.BaseRequestHandler):
             shell.run()
         finally:
             log_event(
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "protocol": "ssh",
-                    "source_ip": source_ip,
-                    "session_id": session_id,
-                    "action": "connection_closed",
-                    "parameters": {},
-                    "raw_metadata": {},
-                    "session_source": "protocol_native",
-                    "response_status": "0",
-                    "response_type": "session_end",
-                    "mitre_attack_id": None,
-                    "mitre_technique_name": None,
-                    "mitre_tactic": None,
-                    "mitre_attack_id_secondary": None,
-                    "mitre_technique_name_secondary": None,
-                    "mitre_confidence": None,
-                }
+                _build_event(
+                    session_id=session_id,
+                    source_ip=source_ip,
+                    protocol="ssh",
+                    action="connection_closed",
+                    parameters={},
+                    response_status="0",
+                    response_type="session_end",
+                )
             )
             unregister_session("ssh", source_ip)
             session_tracker.end_session(session_id)

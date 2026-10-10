@@ -163,8 +163,6 @@ class TelnetSession:
 
             mitre = mitre_analyze(line)
 
-            self._log(line, "0", "pending", mitre)
-
             # SAFETY: No subprocess/os.system — all responses via decide_response()
             # `;` / `&&` / `||` / `|` / redirection lines go to the shared line
             # path, which also resolves any `cd` segment and hands back the cwd.

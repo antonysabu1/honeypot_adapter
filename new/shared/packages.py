@@ -293,9 +293,6 @@ class PackageManager:
         if fs is not None:
             self._install_filesystem_entries(pkg, fs)
 
-        # Record telemetry
-        self._record_telemetry("install", [pkg.name])
-
     def _do_remove(self, pkg: VirtualPackage, purge: bool = False) -> None:
         """Remove (or purge) a package, updating all integrated VirtualOS state."""
         # Mark not installed
@@ -314,9 +311,6 @@ class PackageManager:
         fs = get_filesystem()
         if fs is not None:
             self._remove_filesystem_entries(pkg, fs, purge=purge)
-
-        # Record telemetry
-        self._record_telemetry("remove", [pkg.name], purge=purge)
 
     def _integrate_service_network(self, svc: Any) -> None:
         """Integrate a service's listening ports into the virtual network."""
@@ -361,22 +355,6 @@ class PackageManager:
         # Remove documentation
         doc_dir = f"/usr/share/doc/{pkg.name}"
         fs.rmdir(doc_dir)
-
-    # ── Telemetry integration ────────────────────────────────────────────
-
-    def _record_telemetry(self, action: str, package_names: List[str], purge: bool = False) -> None:
-        """Record package operation telemetry through the shared logger."""
-        from shared.logger import log_event
-        for pkg_name in package_names:
-            log_event(
-                event_type="package_operation",
-                details={
-                    "package": pkg_name,
-                    "action": action,
-                    "purge": purge,
-                },
-                level="info",
-            )
 
     # ── Persistence integration ──────────────────────────────────────────
 

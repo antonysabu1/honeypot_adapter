@@ -2,29 +2,15 @@ import json
 import os
 from pathlib import Path
 
+from shared.events import CONTRACT_KEYS
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "honeypot.jsonl"
 
-REQUIRED_KEYS = (
-    "event_id",
-    "timestamp",
-    "protocol",
-    "source_ip",
-    "session_id",
-    "action",
-    "parameters",
-    "raw_metadata",
-    "session_source",
-    "response_status",
-    "response_type",
-    "mitre_attack_id",
-    "mitre_technique_name",
-    "mitre_tactic",
-    "mitre_attack_id_secondary",
-    "mitre_technique_name_secondary",
-    "mitre_confidence",
-)
+# The adapter contract: exactly these eleven top-level fields. MITRE ATT&CK
+# metadata lives nested under raw_metadata["mitre"], never as a top-level key.
+REQUIRED_KEYS = CONTRACT_KEYS
 
 
 def _max_log_size_bytes() -> int:
@@ -94,6 +80,11 @@ def log_event(event_dict: dict) -> None:
     missing = [key for key in REQUIRED_KEYS if key not in event_dict]
     if missing:
         raise ValueError(f"log_event: missing required keys: {', '.join(missing)}")
+    extra = [key for key in event_dict if key not in REQUIRED_KEYS]
+    if extra:
+        raise ValueError(
+            f"log_event: unauthorized top-level keys: {', '.join(sorted(extra))}"
+        )
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 

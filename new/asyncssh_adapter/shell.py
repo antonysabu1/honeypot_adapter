@@ -105,11 +105,6 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
 
         mitre = mitre_analyze(cmd)
 
-        log_event(build_event(
-            self.session_id, self.source_ip, "ssh", cmd,
-            {"command": cmd}, "0", "pending", mitre=mitre,
-        ))
-
         args = parse_args(cmd)
 
         # `;` / `&&` / `||` / `|` / redirection lines go to the shared line path,
@@ -187,11 +182,6 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
     def _run_exec(self, command: str) -> None:
         cmd = command.strip()
         mitre = mitre_analyze(cmd)
-
-        log_event(build_event(
-            self.session_id, self.source_ip, "ssh", cmd,
-            {"command": cmd}, "0", "pending", mitre=mitre,
-        ))
 
         args = parse_args(cmd)
         if has_shell_syntax(cmd):

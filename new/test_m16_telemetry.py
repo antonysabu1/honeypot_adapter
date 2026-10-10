@@ -23,7 +23,7 @@ from shared.config import get as config_get
 
 
 def test_required_keys_consistency():
-    """Every build_event output must have all 17 REQUIRED_KEYS."""
+    """Every build_event output has exactly the 11 contract top-level keys."""
     passed = 0
     failed = 0
     # Test lifecycle events
@@ -70,11 +70,12 @@ def test_required_keys_consistency():
         print(f"  FAIL ssh whoami with mitre: missing {missing}")
     else:
         passed += 1
-    # Verify MITRE fields are correctly merged
-    if (event["mitre_attack_id"] != "T1033" or
-            event["mitre_technique_name"] != "System Owner/User Discovery" or
-            event["mitre_tactic"] != "Discovery" or
-            event["mitre_confidence"] != "high"):
+    # Verify MITRE fields are correctly merged (nested under raw_metadata)
+    tags = event["raw_metadata"].get("mitre", {})
+    if (tags.get("mitre_attack_id") != "T1033" or
+            tags.get("mitre_technique_name") != "System Owner/User Discovery" or
+            tags.get("mitre_tactic") != "Discovery" or
+            tags.get("mitre_confidence") != "high"):
         failed += 1
         print(f"  FAIL mitre field values incorrect: {event}")
     else:
@@ -97,12 +98,13 @@ def test_jsonl_malformed_line_resilience():
         f.write(json.dumps({
             "event_id": "m16-valid-001", "timestamp": "2026-10-04T10:00:00+00:00",
             "protocol": "ssh", "source_ip": "1.2.3.4", "session_id": "s-1",
-            "action": "whoami", "parameters": {}, "raw_metadata": {},
+            "action": "whoami", "parameters": {},
+            "raw_metadata": {"mitre": {
+                "mitre_attack_id": "T1033", "mitre_technique_name": "System Owner/User Discovery",
+                "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
+                "mitre_technique_name_secondary": None, "mitre_confidence": "high"}},
             "session_source": "protocol_native", "response_status": "0",
             "response_type": "command_output",
-            "mitre_attack_id": "T1033", "mitre_technique_name": "System Owner/User Discovery",
-            "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
-            "mitre_technique_name_secondary": None, "mitre_confidence": "high",
         }) + "\n")
         # Malformed line (not valid JSON)
         f.write("{bad json\n")
@@ -110,12 +112,13 @@ def test_jsonl_malformed_line_resilience():
         f.write(json.dumps({
             "event_id": "m16-valid-002", "timestamp": "2026-10-04T10:01:00+00:00",
             "protocol": "ssh", "source_ip": "1.2.3.4", "session_id": "s-1",
-            "action": "ls /", "parameters": {}, "raw_metadata": {},
+            "action": "ls /", "parameters": {},
+            "raw_metadata": {"mitre": {
+                "mitre_attack_id": "T1083", "mitre_technique_name": "File and Directory Discovery",
+                "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
+                "mitre_technique_name_secondary": None, "mitre_confidence": "high"}},
             "session_source": "protocol_native", "response_status": "0",
             "response_type": "directory_listing",
-            "mitre_attack_id": "T1083", "mitre_technique_name": "File and Directory Discovery",
-            "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
-            "mitre_technique_name_secondary": None, "mitre_confidence": "high",
         }) + "\n")
 
     # Test _prune_log with malformed data
@@ -256,12 +259,13 @@ def test_log_retention_respects_config():
             event = {
                 "event_id": f"ret-{i:03d}", "timestamp": "2026-10-04T10:00:00+00:00",
                 "protocol": "ssh", "source_ip": "1.2.3.4", "session_id": "s-1",
-                "action": "whoami", "parameters": {}, "raw_metadata": {},
+                "action": "whoami", "parameters": {},
+                "raw_metadata": {"mitre": {
+                    "mitre_attack_id": "T1033", "mitre_technique_name": "System Owner/User Discovery",
+                    "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
+                    "mitre_technique_name_secondary": None, "mitre_confidence": "high"}},
                 "session_source": "protocol_native", "response_status": "0",
                 "response_type": "command_output",
-                "mitre_attack_id": "T1033", "mitre_technique_name": "System Owner/User Discovery",
-                "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
-                "mitre_technique_name_secondary": None, "mitre_confidence": "high",
             }
             f.write(json.dumps(event) + "\n")
 
@@ -364,22 +368,18 @@ def test_event_schema_contains_mitre_when_provided():
                "mitre_tactic": "Discovery", "mitre_attack_id_secondary": None,
                "mitre_technique_name_secondary": None, "mitre_confidence": "high"},
     )
+    tags = event_with["raw_metadata"].get("mitre", {})
     without_keys = (
-        "mitre_attack_id" in event_with and "mitre_technique_name" in event_with
-        and "mitre_tactic" in event_with and "mitre_confidence" in event_with
+        tags.get("mitre_attack_id") == "T1033" and tags.get("mitre_confidence") == "high"
+        and tags.get("mitre_tactic") == "Discovery"
     )
-    # Without MITRE (None)
+    # Without MITRE (None) -> raw_metadata carries no mitre tags at all
     event_without = build_event(
         session_id="s-1", source_ip="1.2.3.4", protocol="ssh", action="whoami",
         parameters={}, response_status="0", response_type="command_output",
         mitre=None,
     )
-    null_keys = (
-        event_without["mitre_attack_id"] is None
-        and event_without["mitre_technique_name"] is None
-        and event_without["mitre_tactic"] is None
-        and event_without["mitre_confidence"] is None
-    )
+    null_keys = event_without["raw_metadata"] == {}
     if without_keys and null_keys:
         passed += 1
         print("  PASS event_schema_contains_mitre_when_provided")

@@ -20,6 +20,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from shared.events import mitre_of
+
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "logs" / "honeypot.db"
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 JSONL_PATH = LOG_DIR / "honeypot.jsonl"
@@ -175,10 +177,11 @@ class StorageEngine:
                         params = json.dumps(e.get("parameters", {})) or None
                         rtype = e.get("response_type") or ""
                         status = e.get("response_status") or "0"
-                        mitre = e.get("mitre_attack_id")
-                        mitre_name = e.get("mitre_technique_name")
-                        mitre_tactic = e.get("mitre_tactic")
-                        mitre_sec = e.get("mitre_technique_name_secondary")
+                        tags = mitre_of(e)
+                        mitre = tags.get("mitre_attack_id")
+                        mitre_name = tags.get("mitre_technique_name")
+                        mitre_tactic = tags.get("mitre_tactic")
+                        mitre_sec = tags.get("mitre_technique_name_secondary")
                         self._conn.execute(
                             """INSERT OR IGNORE INTO events
                                (event_id, timestamp, session_id, protocol, action,

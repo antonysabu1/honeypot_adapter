@@ -93,7 +93,6 @@ class FakeSSHShell:
             cmd = "cd /root"
 
         mitre = mitre_analyze(cmd)
-        self._log(cmd, "0", "pending", mitre)
 
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         # args are passed through untouched so flags and non-path operands

@@ -1,15 +1,32 @@
 """Canonical telemetry event builder.
 
-Every transport emits the same event schema, so the builder lives here rather
-than being copied into each adapter. `mitre` is merged in when the caller has
-run shared.mitre.mitre_analyze() over the command; lifecycle events leave those
-fields null.
+The adapter contract fixes exactly eleven top-level fields on every event. The
+MITRE ATT&CK information produced by ``shared.mitre.mitre_analyze()`` is derived
+metadata, so it is nested under ``raw_metadata["mitre"]`` rather than promoted to
+top-level keys. ``shared.logger.log_event()`` rejects any event carrying keys
+outside ``CONTRACT_KEYS``.
 """
 
 import uuid
 from datetime import datetime, timezone
 
-# Fields shared.mitre.mitre_analyze() supplies for attacker commands.
+# The eleven top-level fields every event must carry (the adapter contract).
+CONTRACT_KEYS = (
+    "event_id",
+    "timestamp",
+    "protocol",
+    "source_ip",
+    "session_id",
+    "action",
+    "parameters",
+    "raw_metadata",
+    "session_source",
+    "response_status",
+    "response_type",
+)
+
+# The six MITRE fields carried inside ``raw_metadata["mitre"]`` for attacker
+# commands; lifecycle events leave ``raw_metadata`` empty.
 MITRE_KEYS = (
     "mitre_attack_id",
     "mitre_technique_name",
@@ -30,7 +47,7 @@ def build_event(
     response_type: str,
     mitre: dict | None = None,
 ) -> dict:
-    """Build one telemetry event in the schema shared.logger expects."""
+    """Build one telemetry event carrying exactly the contract's top-level keys."""
     event = {
         "event_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -43,14 +60,21 @@ def build_event(
         "session_source": "protocol_native",
         "response_status": response_status,
         "response_type": response_type,
-        # Lifecycle events are not attacker commands, so MITRE fields are null.
-        "mitre_attack_id": None,
-        "mitre_technique_name": None,
-        "mitre_tactic": None,
-        "mitre_attack_id_secondary": None,
-        "mitre_technique_name_secondary": None,
-        "mitre_confidence": None,
     }
     if mitre:
-        event.update(mitre)
+        event["raw_metadata"]["mitre"] = mitre
     return event
+
+
+def mitre_of(event: dict) -> dict:
+    """Return an event's MITRE tags, or ``{}`` when the event is untagged.
+
+    Reads the nested ``raw_metadata["mitre"]`` location, falling back to the
+    legacy top-level ``mitre_*`` keys so logs written before the contract fix
+    still summarize correctly.
+    """
+    nested = (event.get("raw_metadata") or {}).get("mitre")
+    if nested:
+        return nested
+    legacy = {k: event[k] for k in MITRE_KEYS if k in event}
+    return legacy if any(v is not None for v in legacy.values()) else {}

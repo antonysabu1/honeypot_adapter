@@ -115,12 +115,22 @@ def main() -> None:
         assert "command_not_found" in resp_types, "no command_not_found event"
         assert "session_end" in resp_types, "no session_end event for exit"
         assert all(e["protocol"] == "ssh" for e in events), "non-ssh event found"
-        # Lifecycle events must carry the MITRE keys (null values) for schema
-        # consistency, per the attack-graph / detection-coverage reports.
-        lifecycle = [e for e in events if e["action"] == "connection_established"]
-        assert lifecycle and "mitre_attack_id" in lifecycle[0], (
-            "connection_established missing MITRE keys"
+
+        # Adapter contract: exactly eleven top-level keys per event, and each
+        # interaction logged once (no "pending" placeholder event).
+        contract = {
+            "event_id", "timestamp", "protocol", "source_ip", "session_id",
+            "action", "parameters", "raw_metadata", "session_source",
+            "response_status", "response_type",
+        }
+        assert all(set(e) == contract for e in events), (
+            f"event schema is not the 11-key contract: {sorted(events[0])}"
         )
+        assert "pending" not in resp_types, "duplicate 'pending' event logged"
+        counts = {a: actions.count(a) for a in set(actions)}
+        for action in ("connection_established", "login_attempt", "whoami",
+                       "hacked", "exit", "connection_closed"):
+            assert counts[action] == 1, f"{action} logged {counts[action]}x: {counts}"
 
         print("ALL SSH INTEGRATION TESTS PASSED")
     finally:
