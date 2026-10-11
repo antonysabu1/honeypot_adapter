@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: new
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-asyncssh.txt
+      - name: Import the application (clean-clone guard)
+        run: |
+          python -c "import shared.response_engine, shared.permissions, shared.shell_state, shared.packages, shared.filesystem"
+      - name: Run the test suites
+        run: |
+          set -e
+          for t in \
+            test_startup.py \
+            test_filesystem.py \
+            test_session.py \
+            test_response_engine.py \
+            test_chaining.py \
+            test_shell_syntax.py \
+            test_recon.py \
+            test_acceptance.py \
+            test_groups.py \
+            tests/test_logger.py \
+            test_m16_telemetry.py \
+            test_telemetry_contract.py \
+            test_packages.py \
+            test_permissions.py \
+            test_integration_telnet.py \
+            test_integration_ssh.py \
+            test_integration_asyncssh.py ; do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+      - name: AI adapter boundary
+        run: PYTHONPATH=. python -m ai_adapter.tests.test_ai_boundary
