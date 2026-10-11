@@ -140,6 +140,45 @@ check("bob denied apt-get remove", run(fs, "apt-get remove bash").status == "100
 check("bob denied apt purge", run(fs, "apt purge bash").status == "100")
 check("root passes the apt permission gate", run(fs, "apt-get install bash", "root").status != "100")
 
+print("== rm -rf needs write on every directory it empties ==")
+fs6 = scene()
+# The exact audit reproduction: bob owns /home/bob, but `deep` is a root-owned
+# 0555 dir holding a root file — removing `deep` needs W on /home/bob (bob has
+# it) while emptying `deep` needs W on `deep` (bob does not).
+fs6.mkdir("/home/bob"); fs6.chown("/home/bob", uid=2000, gid=2000)
+fs6.mkdir("/home/bob/deep"); fs6.chown("/home/bob/deep", uid=0, gid=0); fs6.chmod("/home/bob/deep", 0o555)
+fs6.write_file("/home/bob/deep/secret.txt", "top secret\n", mode=0o644)
+fs6.chown("/home/bob/deep/secret.txt", uid=0, gid=0)
+r = run(fs6, "rm -rf /home/bob/deep")
+check("rm -rf into a non-writable dir is denied", "Permission denied" in r.content)
+check("the nested root file survives", fs6.exists("/home/bob/deep/secret.txt"))
+check("root may rm -rf the same tree", run(fs6, "rm -rf /home/bob/deep", "root").status == "0")
+
+print("== mkdir -p stamps every directory it creates ==")
+fs7 = scene()
+run(fs7, "mkdir -p /tmp/bobtree/sub")
+run(fs7, "touch /tmp/bobtree/sub/f")
+check("intermediate dir is owned by the creator", fs7.resolve("/tmp/bobtree").uid == 2000)
+check("leaf dir is owned by the creator", fs7.resolve("/tmp/bobtree/sub").uid == 2000)
+check("bob may rm -rf a tree he made", run(fs7, "rm -rf /tmp/bobtree").status == "0")
+check("the tree is gone", not fs7.exists("/tmp/bobtree"))
+
+print("== rmdir checks permission before probing emptiness ==")
+fs8 = scene()
+# Unwritable parent, non-empty dir: must deny, not disclose emptiness.
+check("rmdir under an unwritable parent says Permission denied",
+      "Permission denied" in run(fs8, "rmdir /root/.ssh").content)
+# Writable parent, non-empty dir: the emptiness message is still correct.
+run(fs8, "mkdir /tmp/bobnonempty")
+run(fs8, "touch /tmp/bobnonempty/f")
+check("rmdir under a writable parent still reports emptiness",
+      "Directory not empty" in run(fs8, "rmdir /tmp/bobnonempty").content)
+
+print("== du / file gate before reading metadata ==")
+fs9 = scene()
+check("du denied before reading", "Permission denied" in run(fs9, "du /root/flag.txt").content)
+check("file denied before resolving", "Permission denied" in run(fs9, "file /root/flag.txt").content)
+
 print("== sequencing keeps its exit status and access policy ==")
 plan = line(fs, "id; cat /root/flag.txt")
 check("chained denial is not a session end", plan.response_type != "session_end")

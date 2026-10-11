@@ -552,9 +552,18 @@ def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
             p = _resolve_path(arg, ctx.cwd)
             if not can_create(ctx.fs, p, ctx.identity):
                 return _denied(f"mkdir: cannot create directory '{arg}': Permission denied\n")
-            existed = ctx.fs.exists(p)
             if parents:
+                # `-p` creates the missing ancestors too, and the creator owns
+                # every one of them; otherwise a non-root user could not write
+                # into, or later remove, the tree they just made.
+                created = []
+                cur = p
+                while cur not in ('', '/') and not ctx.fs.exists(cur):
+                    created.append(cur)
+                    cur = ctx.fs.dirname_of(cur) or '/'
                 ctx.fs.mkdir(p, parents=True)
+                for d in created:
+                    _own(ctx.fs, d, ctx.identity)
             else:
                 parent = '/'.join(p.rstrip('/').split('/')[:-1]) or '/'
                 if ctx.fs.exists(p):
@@ -566,7 +575,6 @@ def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
                     return ResponsePlan('command_not_found',
                                         f"mkdir: cannot create directory '{arg}': No such file or directory\n", '1')
                 ctx.fs.mkdir(p)
-            if not existed:
                 _own(ctx.fs, p, ctx.identity)
         return ResponsePlan('command_output', '', '0')
     return None
@@ -589,7 +597,8 @@ def _cmd_rm(ctx: _Ctx) -> ResponsePlan | None:
                 return _denied(f"rm: cannot remove '{arg}': Permission denied\n")
             if ctx.fs.is_dir(p):
                 if recursive:
-                    _rm_rf(ctx.fs, p)
+                    if not _rm_rf(ctx.fs, p, ctx.identity):
+                        return _denied(f"rm: cannot remove '{arg}': Permission denied\n")
                 else:
                     return ResponsePlan('command_not_found',
                                         f"rm: cannot remove '{arg}': Is a directory\n", '1')
@@ -599,17 +608,27 @@ def _cmd_rm(ctx: _Ctx) -> ResponsePlan | None:
     return None
 
 
-def _rm_rf(fs: FakeFilesystem, path: str) -> None:
+def _rm_rf(fs: FakeFilesystem, path: str, ident) -> bool:
+    """Remove a tree; bash needs ``W`` on every directory it empties.
+
+    Each entry is checked with ``can_unlink`` (its parent must grant W+X), so
+    descending into a directory the identity cannot write aborts instead of
+    silently deleting its contents.  Returns False on the first refusal.
+    """
     if path == '/':
-        return
+        return True
     node = fs._resolve(path)
     if node is None or not node.is_dir:
-        fs.rm(path)
-        return
+        if not can_unlink(fs, path, ident):
+            return False
+        return fs.rm(path)
     for name in list(node.children.keys()):
         child = path.rstrip('/') + '/' + name
-        _rm_rf(fs, child)
-    fs.rmdir(path)
+        if not _rm_rf(fs, child, ident):
+            return False
+    if not can_unlink(fs, path, ident):
+        return False
+    return fs.rmdir(path)
 
 def _cmd_tee(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'tee':
@@ -631,9 +650,10 @@ def _cmd_du(ctx: _Ctx) -> ResponsePlan | None:
         p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'du: missing file operand\n', '127')
-        nbytes = len(ctx.fs.cat(p).encode('utf-8')) or 4096
+        # Policy before read: never touch the content before the check.
         if ctx.fs.exists(p) and not check(ctx.fs, p, ctx.identity, R):
             return _denied(f"du: cannot read directory '{p}': Permission denied\n")
+        nbytes = len(ctx.fs.cat(p).encode('utf-8')) or 4096
         return ResponsePlan('command_output', f'{nbytes}\t{p}\n', '0')
     return None
 
@@ -704,9 +724,10 @@ def _cmd_file(ctx: _Ctx) -> ResponsePlan | None:
         p = _file_operand(ctx.args, ctx.cwd)
         if p is None:
             return ResponsePlan('command_not_found', 'file: missing operand\n', '127')
-        node = ctx.fs._resolve(p)
+        # Policy before lookup: refuse before resolving the inode's metadata.
         if ctx.fs.exists(p) and not traverse(ctx.fs, p, ctx.identity):
             return _denied(f'{p}: Permission denied\n')
+        node = ctx.fs._resolve(p)
         if isinstance(node, dict):
             return ResponsePlan('command_output', f'{p}: directory\n', '0')
         return ResponsePlan('command_output', f'{p}: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, for GNU/Linux 3.2.0, not stripped\n', '0')
@@ -843,11 +864,13 @@ def _cmd_rmdir(ctx: _Ctx) -> ResponsePlan | None:
             if not ctx.fs.is_dir(p):
                 return ResponsePlan('command_not_found',
                                     f"rmdir: failed to remove '{arg}': Not a directory\n", '1')
+            # Policy before probe: a directory the identity may not unlink must
+            # answer Permission denied, never disclose its emptiness.
+            if not can_unlink(ctx.fs, p, ctx.identity):
+                return _denied(f"rmdir: failed to remove '{arg}': Permission denied\n")
             if ctx.fs.ls(p):
                 return ResponsePlan('command_not_found',
                                     f"rmdir: failed to remove '{arg}': Directory not empty\n", '1')
-            if not can_unlink(ctx.fs, p, ctx.identity):
-                return _denied(f"rmdir: failed to remove '{arg}': Permission denied\n")
             ctx.fs.rmdir(p)
         return ResponsePlan('command_output', '', '0')
     return None
