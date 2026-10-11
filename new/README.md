@@ -1,15 +1,38 @@
 # Honeypot — SSH & Telnet Adapters
 
 
+## Requirements
+
+- Python 3.10+
+- `paramiko` + `PyYAML` — required (`requirements.txt`)
+- `asyncssh` — optional, only for the experimental AsyncSSH SSH transport (`requirements-asyncssh.txt`)
+
+A missing `asyncssh` does **not** disable the honeypot: the Paramiko and Telnet
+listeners still start.
+
 ## Install
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt           # required
+pip install -r requirements-asyncssh.txt  # optional AsyncSSH transport
 ```
 
 ## Run
 ```bash
 python main.py
 ```
+
+## Configuration
+
+Settings live in `config/` (`ssh.yaml`, `telnet.yaml`, `honeypot.yaml`,
+`limits.yaml`, `persona.yaml`).
+
+| Setting | Source | Default |
+|---|---|---|
+| SSH adapter | `HONEYPOT_SSH_ADAPTER` env, else `ssh.adapter` | `paramiko` (`asyncssh` experimental) |
+| SSH port | `ssh.port` | `2222` |
+| Telnet port | `telnet.port` | `2323` |
+| Log / DB | `honeypot.log_dir` | `logs/honeypot.jsonl`, `logs/honeypot.db` |
+| Limits | `limits.yaml` | `max_sessions: 100`, `max_commands_per_session: 500`, … |
 
 ## Test SSH
 ```bash
@@ -23,7 +46,46 @@ telnet localhost 2323
 
 ## Logs
 All events are written to logs/honeypot.jsonl.
-Each line is a JSON object with the shared schema.
+Each line is a JSON object with the shared schema (exactly the eleven contract
+fields: `event_id`, `timestamp`, `protocol`, `source_ip`, `session_id`, `action`,
+`parameters`, `raw_metadata`, `session_source`, `response_status`,
+`response_type`). MITRE ATT&CK tags are nested under `raw_metadata["mitre"]`.
+
+## Tests
+
+Run from `new/`. The suites are plain scripts — no test runner required; a
+non-zero exit means failure.
+
+```bash
+python3 test_startup.py                 # imports + host-isolation guard
+python3 test_packages.py                # apt install/remove through the engine
+python3 test_filesystem.py              # core VirtualOS suites
+python3 test_response_engine.py
+python3 test_integration_ssh.py         # Paramiko transport (needs paramiko)
+python3 test_integration_telnet.py      # Telnet transport
+PYTHONPATH=. python3 -m ai_adapter.tests.test_ai_boundary   # AI adapter boundary
+```
+
+For the optional AsyncSSH transport, use a virtualenv that has `asyncssh`:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-asyncssh.txt
+.venv/bin/python test_integration_asyncssh.py
+```
+
+## Simulation & isolation guarantee
+
+SSH and Telnet are answered entirely inside the VirtualOS. Every command goes
+through `shared.response_engine.decide_response()` / `decide_line()` against an
+in-memory `FakeFilesystem`, virtual users/groups/permissions, and virtual
+services. No `old/` reference code is invoked.
+
+Attacker input is never executed on the host: the attacker-facing command path
+imports no `subprocess`/`pty`/`socket` and calls no `os.system`/`eval`/`exec`
+(`test_startup.py` enforces this statically). Redirection (`>`, `>>`, `2>`, …)
+writes only to the simulated filesystem, and reading a host path does not
+disclose host content — both are asserted by `test_startup.py`.
 
 ## Structure
 

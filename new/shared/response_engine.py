@@ -7,7 +7,19 @@ from datetime import datetime, timezone
 from shared.filesystem import FakeFilesystem, UserDatabase, GroupDatabase, valid_name
 from shared.config import get
 from shared.connection_manager import _check_session_command_limit, _increment_session_command_count
-from shared.permissions import identity_for
+from shared.permissions import (
+    R,
+    W,
+    can_chmod,
+    can_chown,
+    can_create,
+    can_list_dir,
+    can_unlink,
+    can_write,
+    check,
+    identity_for,
+    traverse,
+)
 from shared.shell_state import VirtualShellState
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
@@ -46,8 +58,29 @@ class _Ctx:
     cwd: str
     fs: FakeFilesystem
     username: str
-    identity: str
+    # The virtual identity the command runs as, derived from the authoritative
+    # user/group databases. Handlers ask shared.permissions, never the host.
+    identity: object
     shell_state: "VirtualShellState | None" = None
+
+
+def _own(fs, path: str, ident) -> None:
+    """Give a newly created inode to the creating identity, the way POSIX does.
+
+    Root (and the honeypot's presented root shell) creates root-owned files, so
+    this is a no-op for them and cannot change any existing root-session output.
+    """
+    if ident is not None and not ident.is_root:
+        fs.chown(path, uid=ident.uid, gid=ident.gid)
+
+
+def _denied(message: str, status: str = "1") -> ResponsePlan:
+    """A permission failure: a plausible shell message, session left running.
+
+    The decision itself always comes from ``shared.permissions``; this only
+    renders it as a command's own error output.
+    """
+    return ResponsePlan("command_not_found", message, status)
 
 def _cmd_ls(ctx: _Ctx) -> ResponsePlan | None:
     # exact base, so lscpu/lsblk/lsof fall through to their own handlers
@@ -60,6 +93,14 @@ def _cmd_ls(ctx: _Ctx) -> ResponsePlan | None:
         if not ctx.fs.exists(path):
             return ResponsePlan('command_not_found',
                                 f"ls: cannot access '{path}': No such file or directory\n", '2')
+        # Access is decided by shared.permissions (root bypasses); listing a
+        # directory additionally needs R on the directory itself.
+        if not traverse(ctx.fs, path, ctx.identity):
+            return ResponsePlan('command_not_found',
+                                f"ls: cannot access '{path}': Permission denied\n", '2')
+        if not ctx.fs.is_file(path) and not can_list_dir(ctx.fs, path, ctx.identity):
+            return ResponsePlan('command_not_found',
+                                f"ls: cannot open directory '{path}': Permission denied\n", '2')
         if ctx.fs.is_file(path):
             if long_fmt:
                 return ResponsePlan('directory_listing', ctx.fs.ls_long_single(path) + '\n', '0')
@@ -87,6 +128,8 @@ def _cmd_cat(ctx: _Ctx) -> ResponsePlan | None:
         p = _resolve_path(ctx.args[0], ctx.cwd) if ctx.args else _resolve_path(ctx.cmd[4:].strip(), ctx.cwd)
         # A missing file is a failure in bash, so `cat /nope && whoami` must not
         # run the second command. The message stays as it was.
+        if ctx.fs.is_file(p) and not check(ctx.fs, p, ctx.identity, R):
+            return _denied(f"cat: {p}: Permission denied\n")
         status = '0' if ctx.fs.is_file(p) else '1'
         return ResponsePlan('file_contents', ctx.fs.cat(p), status)
     return None
@@ -108,6 +151,8 @@ def _cmd_view(ctx: _Ctx) -> ResponsePlan | None:
     if not ctx.fs.is_file(path):
         why = 'Is a directory' if ctx.fs.is_dir(path) else 'No such file or directory'
         return ResponsePlan('command_not_found', f'{ctx.base}: {path}: {why}\n', '2')
+    if not check(ctx.fs, path, ctx.identity, R):
+        return _denied(f'{ctx.base}: {path}: Permission denied\n')
 
     text, status = apply_filter(ctx.cmd, ctx.fs.cat(path))
     if ctx.base == 'wc':
@@ -240,6 +285,10 @@ def _cmd_hostname(ctx: _Ctx) -> ResponsePlan | None:
         return ResponsePlan('command_output', 'honeypot', '0')
     return None
 
+def _apt_denied() -> ResponsePlan:
+    """apt's own refusal when the caller cannot write the package database."""
+    return ResponsePlan('command_output', "E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)\nE: Unable to acquire the dpkg frontend lock, are you root?\n", '100')
+
 def _cmd_apt(ctx: _Ctx) -> ResponsePlan | None:
     """Handle the `apt` and `apt-get` commands.
 
@@ -302,47 +351,36 @@ def _cmd_apt(ctx: _Ctx) -> ResponsePlan | None:
     if subcommand == 'install':
         if not pkg_name:
             return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
-        results = pm.apt_get_install([pkg_name])
+        if not can_write(ctx.fs, f"/var/lib/{pkg_name}", ctx.identity):
+            return _apt_denied()
+        results = pm.apt_get_install([pkg_name], fs=ctx.fs)
         pkg_result = results[0]
-        pkg = pm.get(pkg_name)
         status_msg = pkg_result[1]
-        if pkg_result[0] == 'installed' and pkg is not None and pkg.installed:
-            # Cross-component integration: filesystem, services, processes, network
-            fs = ctx.fs
-            if fs is not None:
-                pkg._do_install(pkg)  # type: ignore[attr-defined]  # will integrate fs
-            # Build response
+        if pkg_result[1] == 'installed':
             return ResponsePlan('command_output', f"{pkg_name} set to installed.\n", '0')
         return ResponsePlan('command_output', f"{status_msg}\n", '1')
 
     if subcommand == 'remove':
         if not pkg_name:
             return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
-        results = pm.apt_get_remove([pkg_name])
+        if not can_write(ctx.fs, f"/var/lib/{pkg_name}", ctx.identity):
+            return _apt_denied()
+        results = pm.apt_get_remove([pkg_name], fs=ctx.fs)
         pkg_result = results[0]
         status_msg = pkg_result[1]
-        if pkg_result[0] == 'removed':
-            # Cross-component integration: remove filesystem, services, processes, network
-            fs = ctx.fs
-            if fs is not None:
-                pkg = pm.get(pkg_name)
-                if pkg is not None:
-                    pkg._do_remove(pkg, purge=False)  # type: ignore[attr-defined]
+        if pkg_result[1] == 'removed':
             return ResponsePlan('command_output', f"{pkg_name} removed.\n", '0')
         return ResponsePlan('command_output', f"{status_msg}\n", '1')
 
     if subcommand == 'purge':
         if not pkg_name:
             return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
-        results = pm.apt_get_remove([pkg_name], purge=True)
+        if not can_write(ctx.fs, f"/var/lib/{pkg_name}", ctx.identity):
+            return _apt_denied()
+        results = pm.apt_get_remove([pkg_name], purge=True, fs=ctx.fs)
         pkg_result = results[0]
         status_msg = pkg_result[1]
-        if pkg_result[0] == 'removed':
-            fs = ctx.fs
-            if fs is not None:
-                pkg = pm.get(pkg_name)
-                if pkg is not None:
-                    pkg._do_remove(pkg, purge=True)  # type: ignore[attr-defined]
+        if pkg_result[1] == 'removed':
             return ResponsePlan('command_output', f"{pkg_name} purged.\n", '0')
         return ResponsePlan('command_output', f"{status_msg}\n", '1')
 # Default fallback for unrecognized apt/apt-get subcommands
@@ -492,7 +530,14 @@ def _cmd_touch(ctx: _Ctx) -> ResponsePlan | None:
             if arg.startswith('-'):
                 continue
             p = _resolve_path(arg, ctx.cwd)
+            existed = ctx.fs.exists(p)
+            allowed = (can_write(ctx.fs, p, ctx.identity) if existed
+                       else can_create(ctx.fs, p, ctx.identity))
+            if not allowed:
+                return _denied(f"touch: cannot touch '{arg}': Permission denied\n")
             ctx.fs.touch(p)
+            if not existed:
+                _own(ctx.fs, p, ctx.identity)
         return ResponsePlan('command_output', '', '0')
     return None
 
@@ -504,8 +549,11 @@ def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
         targets = [a for a in ctx.args if not a.startswith('-')]
         for arg in targets:
             p = _resolve_path(arg, ctx.cwd)
+            if not can_create(ctx.fs, p, ctx.identity):
+                return _denied(f"mkdir: cannot create directory '{arg}': Permission denied\n")
+            existed = ctx.fs.exists(p)
             if parents:
-                _mkdir_p(ctx.fs, p)
+                ctx.fs.mkdir(p, parents=True)
             else:
                 parent = '/'.join(p.rstrip('/').split('/')[:-1]) or '/'
                 if ctx.fs.exists(p):
@@ -517,18 +565,10 @@ def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
                     return ResponsePlan('command_not_found',
                                         f"mkdir: cannot create directory '{arg}': No such file or directory\n", '1')
                 ctx.fs.mkdir(p)
+            if not existed:
+                _own(ctx.fs, p, ctx.identity)
         return ResponsePlan('command_output', '', '0')
     return None
-
-
-def _mkdir_p(fs: FakeFilesystem, path: str) -> None:
-    parts = fs._split(path)
-    current = '/'
-    for part in parts:
-        child = current.rstrip('/') + '/' + part
-        if not fs.exists(child):
-            fs.mkdir(child)
-        current = child
 
 def _cmd_rm(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'rm':
@@ -544,6 +584,8 @@ def _cmd_rm(ctx: _Ctx) -> ResponsePlan | None:
                     return ResponsePlan('command_not_found',
                                         f"rm: cannot remove '{arg}': No such file or directory\n", '1')
                 continue
+            if not can_unlink(ctx.fs, p, ctx.identity):
+                return _denied(f"rm: cannot remove '{arg}': Permission denied\n")
             if ctx.fs.is_dir(p):
                 if recursive:
                     _rm_rf(ctx.fs, p)
@@ -589,6 +631,8 @@ def _cmd_du(ctx: _Ctx) -> ResponsePlan | None:
         if p is None:
             return ResponsePlan('command_not_found', 'du: missing file operand\n', '127')
         nbytes = len(ctx.fs.cat(p).encode('utf-8')) or 4096
+        if ctx.fs.exists(p) and not check(ctx.fs, p, ctx.identity, R):
+            return _denied(f"du: cannot read directory '{p}': Permission denied\n")
         return ResponsePlan('command_output', f'{nbytes}\t{p}\n', '0')
     return None
 
@@ -657,6 +701,8 @@ def _cmd_file(ctx: _Ctx) -> ResponsePlan | None:
         if p is None:
             return ResponsePlan('command_not_found', 'file: missing operand\n', '127')
         node = ctx.fs._resolve(p)
+        if ctx.fs.exists(p) and not traverse(ctx.fs, p, ctx.identity):
+            return _denied(f'{p}: Permission denied\n')
         if isinstance(node, dict):
             return ResponsePlan('command_output', f'{p}: directory\n', '0')
         return ResponsePlan('command_output', f'{p}: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, for GNU/Linux 3.2.0, not stripped\n', '0')
@@ -670,6 +716,8 @@ def _cmd_stat(ctx: _Ctx) -> ResponsePlan | None:
         if not ctx.fs.exists(p):
             return ResponsePlan('command_not_found',
                                 f"stat: cannot stat '{p}': No such file or directory\n", '1')
+        if not traverse(ctx.fs, p, ctx.identity):
+            return _denied(f"stat: cannot stat '{p}': Permission denied\n")
         return ResponsePlan('command_output', ctx.fs.stat(p), '0')
     return None
 
@@ -694,6 +742,8 @@ def _cmd_chmod(ctx: _Ctx) -> ResponsePlan | None:
             if not ctx.fs.exists(p):
                 return ResponsePlan('command_not_found',
                                     f"chmod: cannot access '{arg}': No such file or directory\n", '1')
+            if not can_chmod(ctx.fs, p, ctx.identity):
+                return _denied(f"chmod: changing permissions of '{arg}': Operation not permitted\n")
             ctx.fs.chmod(p, mode)
         return ResponsePlan('command_output', '', '0')
     return None
@@ -710,6 +760,8 @@ def _cmd_chown(ctx: _Ctx) -> ResponsePlan | None:
             if not ctx.fs.exists(p):
                 return ResponsePlan('command_not_found',
                                     f"chown: cannot access '{arg}': No such file or directory\n", '1')
+            if not can_chown(ctx.fs, p, ctx.identity, new_uid=uid, new_gid=gid):
+                return _denied(f"chown: changing ownership of '{arg}': Operation not permitted\n")
             ctx.fs.chown(p, uid=uid, gid=gid)
         return ResponsePlan('command_output', '', '0')
     return None
@@ -759,6 +811,8 @@ def _cmd_ln(ctx: _Ctx) -> ResponsePlan | None:
                                 f"ln: failed to access '{src}': Is a directory\n", '1')
         if ctx.fs.is_dir(dst_p):
             dst_p = dst_p.rstrip('/') + '/' + src.rsplit('/', 1)[-1]
+        if not can_write(ctx.fs, dst_p, ctx.identity):
+            return _denied(f"ln: failed to create link '{dst}': Permission denied\n")
         if symlink:
             src_content = ctx.fs.read_content(src_p) or ""
             ctx.fs.write_file(dst_p, f"symlink:{src_p}")
@@ -785,6 +839,8 @@ def _cmd_rmdir(ctx: _Ctx) -> ResponsePlan | None:
             if ctx.fs.ls(p):
                 return ResponsePlan('command_not_found',
                                     f"rmdir: failed to remove '{arg}': Directory not empty\n", '1')
+            if not can_unlink(ctx.fs, p, ctx.identity):
+                return _denied(f"rmdir: failed to remove '{arg}': Permission denied\n")
             ctx.fs.rmdir(p)
         return ResponsePlan('command_output', '', '0')
     return None
@@ -929,9 +985,11 @@ def _cmd_pip(ctx: _Ctx) -> ResponsePlan | None:
     if subcommand == 'install':
         if not pkg_name:
             return ResponsePlan('command_output', 'E: Missing package name.\n', '1')
-        results = pm.apt_get_install([pkg_name])
+        if not can_write(ctx.fs, "/usr/lib/python3/dist-packages", ctx.identity):
+            return ResponsePlan('command_output', "ERROR: Could not install packages due to an OSError: [Errno 13] Permission denied: '/usr/lib/python3/dist-packages'\nConsider using the `--user` option or check the permissions.\n", '1')
+        results = pm.apt_get_install([pkg_name], fs=ctx.fs)
         pkg_result = results[0]
-        if pkg_result[0] == 'installed':
+        if pkg_result[1] == 'installed':
             return ResponsePlan('command_output', f"{pkg_name} installed.\n", '0')
         return ResponsePlan('command_output', f"{pkg_result[1]}\n", '1')
 
@@ -956,7 +1014,10 @@ def _cmd_wget(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_history(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'history':
-        return ResponsePlan('command_output', ctx.fs.cat('/root/.bash_history'), '0')
+        p = '/root/.bash_history'
+        if ctx.fs.exists(p) and not check(ctx.fs, p, ctx.identity, R):
+            return _denied(f'history: cannot read {p}: Permission denied\n')
+        return ResponsePlan('command_output', ctx.fs.cat(p), '0')
     return None
 
 def _cmd_ping(ctx: _Ctx) -> ResponsePlan | None:
@@ -983,6 +1044,8 @@ def _cmd_cp(ctx: _Ctx) -> ResponsePlan | None:
         if ctx.fs.is_dir(src_p):
             return ResponsePlan('command_not_found',
                                 f"cp: -r not specified; omitting directory '{src}'\n", '1')
+        if not check(ctx.fs, src_p, ctx.identity, R) or not can_write(ctx.fs, dst_p, ctx.identity):
+            return _denied(f"cp: cannot open '{src}' for reading: Permission denied\n")
         if not ctx.fs.cp(src_p, dst_p):
             return ResponsePlan('command_not_found', f"cp: failed to copy '{src}'\n", '1')
         return ResponsePlan('command_output', '', '0')
@@ -999,6 +1062,8 @@ def _cmd_mv(ctx: _Ctx) -> ResponsePlan | None:
         if not ctx.fs.exists(src_p):
             return ResponsePlan('command_not_found',
                                 f"mv: cannot stat '{src}': No such file or directory\n", '1')
+        if not can_unlink(ctx.fs, src_p, ctx.identity) or not can_write(ctx.fs, dst_p, ctx.identity):
+            return _denied(f"mv: cannot move '{src}' to '{dst}': Permission denied\n")
         if not ctx.fs.mv(src_p, dst_p):
             return ResponsePlan('command_not_found', f"mv: failed to move '{src}'\n", '1')
         return ResponsePlan('command_output', '', '0')
@@ -1550,7 +1615,7 @@ def _run_pipeline(
 
 
 def _apply_redirections(
-    plan: ResponsePlan, red, cwd: str, fs: FakeFilesystem
+    plan: ResponsePlan, red, cwd: str, fs: FakeFilesystem, ident=None
 ) -> ResponsePlan:
     """Honour a segment's redirections and record where output went."""
     if not red.any:
@@ -1565,7 +1630,15 @@ def _apply_redirections(
         # way a command's stdout normally is.
         if text and not text.endswith("\n"):
             text += "\n"
-        if not fs.write(_resolve_path(target, cwd), text, append=red.append):
+        target_path = _resolve_path(target, cwd)
+        # Redirecting into a file is a write: it takes the same permission as
+        # any other write, so a redirection cannot bypass the access policy.
+        if ident is not None and not can_write(fs, target_path, ident):
+            return ResponsePlan("command_output",
+                                f"bash: {target}: Permission denied\n", "1",
+                                redirect=redirects)
+        existed = fs.exists(target_path)
+        if not fs.write(target_path, text, append=red.append):
             # bash refuses an unwritable target instead of pretending it wrote.
             return ResponsePlan(
                 "command_output",
@@ -1573,6 +1646,8 @@ def _apply_redirections(
                 "1",
                 redirect=redirects,
             )
+        if not existed:
+            _own(fs, target_path, ident)
 
     return ResponsePlan(
         plan.response_type,
@@ -1588,6 +1663,7 @@ def _run_segment(
     protocol: str,
     session_id: str,
     username: str,
+    ident=None,
 ) -> tuple[ResponsePlan, str]:
     """Run one `;`-separated segment: its pipeline, redirections and `cd`."""
     stages, red = parse_segment(segment)
@@ -1596,19 +1672,27 @@ def _run_segment(
         # and exits 0, the way bash does. Reads are never written to.
         for target in (red.stdout_target, red.stderr_target):
             if target and not is_devnull(target):
-                fs.write(_resolve_path(target, cwd), "")
+                target_path = _resolve_path(target, cwd)
+                if ident is not None and not can_write(fs, target_path, ident):
+                    return ResponsePlan("command_output",
+                                        f"bash: {target}: Permission denied\n", "1",
+                                        redirect=",".join(red.targets()) or None), cwd
+                existed = fs.exists(target_path)
+                fs.write(target_path, "")
+                if not existed:
+                    _own(fs, target_path, ident)
         return ResponsePlan("command_output", "", "0",
                             redirect=",".join(red.targets()) or None), cwd
 
     # `cd` is shell state, not a stage: it is never piped or redirected.
     if len(stages) == 1 and (stages[0] == "cd" or stages[0].startswith("cd ")):
-        result = resolve_cd(stages[0][2:].strip(), cwd, fs)
+        result = resolve_cd(stages[0][2:].strip(), cwd, fs, ident)
         if result.ok:
             return ResponsePlan("command_output", "", "0"), result.cwd
         return ResponsePlan("cd_failed", result.error, "1"), cwd
 
     plan, new_cwd = _run_pipeline(stages, cwd, fs, protocol, session_id, username)
-    return _apply_redirections(plan, red, cwd, fs), new_cwd
+    return _apply_redirections(plan, red, cwd, fs, ident), new_cwd
 
 def decide_line(
     protocol: str,
@@ -1632,6 +1716,7 @@ def decide_line(
         ), cwd
 
     tokens = _tokenize(action)
+    ident = identity_for(fs, username)
     ran: list[ResponsePlan] = []
     status = "0"
     for connector, segment in tokens:
@@ -1642,7 +1727,7 @@ def decide_line(
         if connector == "||" and status == "0":
             continue
 
-        plan, cwd = _run_segment(segment, cwd, fs, protocol, session_id, username)
+        plan, cwd = _run_segment(segment, cwd, fs, protocol, session_id, username, ident)
         status = plan.status
         if plan.response_type == "session_end":
             return ResponsePlan("session_end", plan.content, plan.status), cwd

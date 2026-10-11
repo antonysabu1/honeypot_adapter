@@ -175,7 +175,6 @@ class TelnetSession:
                     {"args": args, "cwd": self.current_dir},
                     self.fs,
                     username=self.username or "root",
-                    shell_state=self.shell_state,
                 )
                 if new_cwd != self.current_dir:
                     self.current_dir = new_cwd

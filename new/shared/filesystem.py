@@ -647,9 +647,21 @@ class FakeFilesystem:
 
     # ── mutations ────────────────────────────────────────────────────────
 
-    def mkdir(self, path: str, *, mode: int = 0o755) -> bool:
-        n = self._make_dir(mode=mode)
-        return self._link(path, n)
+    def mkdir(self, path: str, *, mode: int = 0o755, parents: bool = False) -> bool:
+        """Create a directory; with ``parents=True`` also its missing ancestors.
+
+        Every directory is created through ``_make_dir`` + ``_link`` — the same
+        path the non-recursive form uses — so the structural parent validation
+        is never skipped.
+        """
+        if not parents:
+            return self._link(path, self._make_dir(mode=mode))
+        current = ""
+        for part in self._split(path):
+            current += "/" + part
+            if self._resolve(current) is None:
+                self._link(current, self._make_dir(mode=mode))
+        return self._resolve(path) is not None
 
     def touch(self, path: str, *, mode: int = 0o644) -> bool:
         existing = self._resolve(path)
@@ -733,9 +745,10 @@ class FakeFilesystem:
     # ── link / unlink internals ──────────────────────────────────────────
 
     def _link(self, path: str, inode: Inode) -> bool:
-        parent, name = self._parent(path)
-        if parent is None or not parent.is_dir:
+        found = self._parent(path)
+        if found is None or not found[0].is_dir:
             return False
+        parent, name = found
         parent.children[name] = inode
         parent.mtime = _now()
         return True

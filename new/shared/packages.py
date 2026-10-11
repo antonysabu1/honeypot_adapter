@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ── Package identification ────────────────────────────────────────────────
 
@@ -184,7 +184,8 @@ class PackageManager:
             return "E: No packages installed."
         return "\n".join(lines)
 
-    def apt_get_install(self, package_names: List[str]) -> List[Tuple[str, str]]:
+    def apt_get_install(self, package_names: List[str],
+                        fs: Any = None) -> List[Tuple[str, str]]:
         """Simulate `apt-get install <packages>`.
 
         Returns list of (package_name, status) tuples:
@@ -213,11 +214,12 @@ class PackageManager:
                 results.append((pkg_name, f"E: Dependency problem: {', '.join(missing)}"))
                 continue
             # Install the package
-            self._do_install(pkg)
+            self._do_install(pkg, fs)
             results.append((pkg_name, "installed"))
         return results
 
-    def apt_get_remove(self, package_names: List[str], purge: bool = False) -> List[Tuple[str, str]]:
+    def apt_get_remove(self, package_names: List[str], purge: bool = False,
+                       fs: Any = None) -> List[Tuple[str, str]]:
         """Simulate `apt-get remove/purge <packages>`.
 
         Returns list of (package_name, status) tuples.
@@ -235,7 +237,7 @@ class PackageManager:
                 results.append((pkg_name, f"E: Package '{pkg_name}' is not installed"))
                 continue
             # Perform removal
-            self._do_remove(pkg, purge=purge)
+            self._do_remove(pkg, purge=purge, fs=fs)
             results.append((pkg_name, "removed"))
         return results
 
@@ -264,97 +266,65 @@ class PackageManager:
 
     # ── Internal installation/removal ─────────────────────────────────────
 
-    def _do_install(self, pkg: VirtualPackage) -> None:
-        """Install a package, updating all integrated VirtualOS state."""
-        # Mark installed
+    def _do_install(self, pkg: VirtualPackage, fs: Any = None) -> None:
+        """Install a package: mark it installed and create its simulated
+        filesystem entries when a virtual filesystem is supplied.
+
+        Service/process integration is deliberately absent: no tracked, wired
+        implementation of those managers exists, so nothing is faked here.
+        """
         pkg.installed = True
-
-        # Update associated service if any
-        if pkg.associated_service:
-            sm = get_service_manager()
-            if sm is not None:
-                svc = sm.get_service(pkg.associated_service)
-                if svc is not None:
-                    svc.state = "running"
-                    if svc.pid is None:
-                        # Create associated virtual process
-                        pm = get_process_manager()
-                        new_proc = pm.create(
-                            ppid=1,
-                            username="root",
-                            cmdline=f"/usr/sbin/{pkg.associated_service}",
-                        )
-                        svc.pid = new_proc.pid
-                        # Update network if service has listening ports
-                        self._integrate_service_network(svc)
-
-        # Create virtual filesystem entries for installed package
-        fs = get_filesystem()
         if fs is not None:
             self._install_filesystem_entries(pkg, fs)
 
-    def _do_remove(self, pkg: VirtualPackage, purge: bool = False) -> None:
-        """Remove (or purge) a package, updating all integrated VirtualOS state."""
-        # Mark not installed
+    def _do_remove(self, pkg: VirtualPackage, purge: bool = False, fs: Any = None) -> None:
+        """Remove (or purge) a package and drop its simulated filesystem entries."""
         pkg.installed = False
-
-        # Stop and remove associated service if any
-        if pkg.associated_service:
-            sm = get_service_manager()
-            if sm is not None:
-                svc = sm.get_service(pkg.associated_service)
-                if svc is not None:
-                    svc.state = "stopped"
-                    svc.pid = None
-
-        # Remove virtual filesystem entries for package
-        fs = get_filesystem()
         if fs is not None:
             self._remove_filesystem_entries(pkg, fs, purge=purge)
 
-    def _integrate_service_network(self, svc: Any) -> None:
-        """Integrate a service's listening ports into the virtual network."""
-        # This is handled by the service start/stop flow through network module
-        pass
-
     def _install_filesystem_entries(self, pkg: VirtualPackage, fs: Any) -> None:
-        """Create virtual filesystem entries associated with an installed package."""
-        # Create /var/lib/<pkg> directory
+        """Create the simulated filesystem entries for an installed package."""
         pkg_dir = f"/var/lib/{pkg.name}"
-        fs.mkdir(pkg_dir, mode=0o755)
+        fs.mkdir(pkg_dir, parents=True)
 
-        # Create conffile entries if any
-        # For baseline packages, create minimal marker files
-        conffile_dir = f"/etc/{pkg.name}"
         if pkg.conffiles:
-            fs.mkdir(conffile_dir, mode=0o755)
+            conffile_dir = f"/etc/{pkg.name}"
+            fs.mkdir(conffile_dir, parents=True)
             for conffile in pkg.conffiles:
-                marker_path = f"{conffile_dir}/{conffile}"
-                fs.write_file(marker_path, f"# Configuration file for {pkg.name}\n", mode=0o644)
+                fs.write_file(f"{conffile_dir}/{conffile}",
+                              f"# Configuration file for {pkg.name}\n", mode=0o644)
         else:
-            # Default: create a marker file for the package
-            fs.write_file(f"{pkg_dir}/installed", f"Package {pkg.name}-{pkg.version} installed\n", mode=0o644)
+            fs.write_file(f"{pkg_dir}/installed",
+                          f"Package {pkg.name}-{pkg.version} installed\n", mode=0o644)
 
-        # Create documentation stub
         doc_dir = f"/usr/share/doc/{pkg.name}"
-        fs.mkdir(doc_dir, mode=0o755)
+        fs.mkdir(doc_dir, parents=True)
         fs.write_file(f"{doc_dir}/changelog.Debian.gz", "", mode=0o644)
         fs.write_file(f"{doc_dir}/copyright", f"# {pkg.name} license\n", mode=0o644)
 
-    def _remove_filesystem_entries(self, pkg: VirtualPackage, fs: Any, purge: bool = False) -> None:
-        """Remove virtual filesystem entries associated with a package removal."""
+    def _remove_filesystem_entries(self, pkg: VirtualPackage, fs: Any,
+                                   purge: bool = False) -> None:
+        """Remove the simulated filesystem entries created at install time.
+
+        Only the files this module creates are touched, then the now-empty
+        directories are removed. Package conffiles are kept on ``remove`` and
+        dropped only on ``purge`` (Debian semantics).
+        """
         pkg_dir = f"/var/lib/{pkg.name}"
-        # Remove package directory and all contents
-        fs.rmdir(pkg_dir)  # Will silently fail if not empty; that's OK
-
-        # Remove conffile directory if not purge
-        if not purge:
-            conffile_dir = f"/etc/{pkg.name}"
-            fs.rmdir(conffile_dir)
-
-        # Remove documentation
         doc_dir = f"/usr/share/doc/{pkg.name}"
-        fs.rmdir(doc_dir)
+        conffile_dir = f"/etc/{pkg.name}" if purge and pkg.conffiles else None
+
+        files = [f"{pkg_dir}/installed", f"{doc_dir}/changelog.Debian.gz",
+                 f"{doc_dir}/copyright"]
+        if conffile_dir:
+            files += [f"{conffile_dir}/{c}" for c in pkg.conffiles]
+        for path in files:
+            if fs.exists(path):
+                fs.rm(path)
+        for directory in (pkg_dir, doc_dir, conffile_dir):
+            if directory and fs.exists(directory):
+                fs.rmdir(directory)
 
     # ── Persistence integration ──────────────────────────────────────────
 

@@ -111,7 +111,6 @@ class FakeSSHShell:
                 {"args": args, "cwd": self.current_dir},
                 self.fs,
                 username=self.username,
-                shell_state=self.shell_state,
             )
             self._apply_cwd(new_cwd)
         else:
