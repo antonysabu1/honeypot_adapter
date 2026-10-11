@@ -561,7 +561,9 @@ def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
                 while cur not in ('', '/') and not ctx.fs.exists(cur):
                     created.append(cur)
                     cur = ctx.fs.dirname_of(cur) or '/'
-                ctx.fs.mkdir(p, parents=True)
+                if not ctx.fs.mkdir(p, parents=True):
+                    return ResponsePlan('command_not_found',
+                                        f"mkdir: cannot create directory '{arg}': Not a directory\n", '1')
                 for d in created:
                     _own(ctx.fs, d, ctx.identity)
             else:
@@ -574,18 +576,22 @@ def _cmd_mkdir(ctx: _Ctx) -> ResponsePlan | None:
                 if not ctx.fs.exists(parent):
                     return ResponsePlan('command_not_found',
                                         f"mkdir: cannot create directory '{arg}': No such file or directory\n", '1')
-                ctx.fs.mkdir(p)
+                if not ctx.fs.mkdir(p):
+                    return ResponsePlan('command_not_found',
+                                        f"mkdir: cannot create directory '{arg}': Not a directory\n", '1')
                 _own(ctx.fs, p, ctx.identity)
         return ResponsePlan('command_output', '', '0')
     return None
 
 def _cmd_rm(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'rm':
-        if not ctx.args:
-            return ResponsePlan('command_not_found', 'rm: missing operand\n', '1')
         force = 'f' in ''.join(a[1:] for a in ctx.args if a.startswith('-') and len(a) > 1)
         recursive = 'r' in ''.join(a[1:] for a in ctx.args if a.startswith('-') and len(a) > 1)
         targets = [a for a in ctx.args if not a.startswith('-')]
+        # `rm -rf` with no operand is still a missing operand: judge the guard
+        # on the remaining targets, not on the raw argument count.
+        if not targets:
+            return ResponsePlan('command_not_found', 'rm: missing operand\n', '1')
         for arg in targets:
             p = _resolve_path(arg, ctx.cwd)
             if not ctx.fs.exists(p):

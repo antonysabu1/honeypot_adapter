@@ -179,6 +179,20 @@ fs9 = scene()
 check("du denied before reading", "Permission denied" in run(fs9, "du /root/flag.txt").content)
 check("file denied before resolving", "Permission denied" in run(fs9, "file /root/flag.txt").content)
 
+print("== argument handling: missing operand and non-directory parent ==")
+fs10 = scene()
+check("flag-only rm -rf reports missing operand",
+      run(fs10, "rm -rf").status == "1" and "missing operand" in run(fs10, "rm -rf").content)
+check("bare rm reports missing operand", run(fs10, "rm").status == "1")
+check("mkdir -p under a non-directory parent errors",
+      run(fs10, "mkdir -p /etc/hostname/child", "root").status == "1")
+check("mkdir under a non-directory parent errors",
+      run(fs10, "mkdir /etc/hostname/child", "root").status == "1")
+check("legitimate mkdir -p still succeeds", run(fs10, "mkdir -p /tmp/aa/bb").status == "0")
+check("legitimate rm -rf still succeeds", run(fs10, "rm -rf /tmp/aa").status == "0")
+check("rm of a nonexistent path still errors", run(fs10, "rm /nope").status == "1")
+check("rm -f of a nonexistent path stays silent", run(fs10, "rm -f /nope").status == "0")
+
 print("== sequencing keeps its exit status and access policy ==")
 plan = line(fs, "id; cat /root/flag.txt")
 check("chained denial is not a session end", plan.response_type != "session_end")
