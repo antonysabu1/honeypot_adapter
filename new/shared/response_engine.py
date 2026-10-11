@@ -10,6 +10,7 @@ from shared.connection_manager import _check_session_command_limit, _increment_s
 from shared.permissions import (
     R,
     W,
+    can_administer,
     can_chmod,
     can_chown,
     can_create,
@@ -689,6 +690,9 @@ def _cmd_find(ctx: _Ctx) -> ResponsePlan | None:
                 if d != start and ctx.fs.is_dir(d):
                     dirs_to_search.append(d)
             for d in dirs_to_search:
+                # A directory the identity cannot list must not disclose names.
+                if not can_list_dir(ctx.fs, d, ctx.identity):
+                    continue
                 for entry in ctx.fs.ls(d):
                     if entry == name:
                         results.append(f'{d.rstrip("/")}/{entry}')
@@ -814,9 +818,12 @@ def _cmd_ln(ctx: _Ctx) -> ResponsePlan | None:
         if not can_write(ctx.fs, dst_p, ctx.identity):
             return _denied(f"ln: failed to create link '{dst}': Permission denied\n")
         if symlink:
-            src_content = ctx.fs.read_content(src_p) or ""
             ctx.fs.write_file(dst_p, f"symlink:{src_p}")
         else:
+            # A hard link here copies the file's bytes, so it needs read access
+            # to the source — otherwise it would launder an unreadable file.
+            if not check(ctx.fs, src_p, ctx.identity, R):
+                return _denied(f"ln: failed to access '{src}': Permission denied\n")
             content = ctx.fs.read_content(src_p) or ""
             ctx.fs.write_file(dst_p, content)
         return ResponsePlan('command_output', '', '0')
@@ -1093,6 +1100,8 @@ def _operands(args: list, value_flags: tuple = ()) -> list:
 
 def _cmd_useradd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'useradd':
+        if not can_administer(ctx.identity):
+            return _denied('useradd: Permission denied.\n')
         names = _operands(ctx.args, value_flags=('-d', '-u', '-g', '-s'))
         if not names:
             return ResponsePlan('command_not_found', 'useradd: missing USERNAME\n', '1')
@@ -1138,6 +1147,8 @@ def _cmd_useradd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_userdel(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'userdel':
+        if not can_administer(ctx.identity):
+            return _denied('userdel: Permission denied.\n')
         names = _operands(ctx.args, value_flags=('-r',))
         if not names:
             return ResponsePlan('command_not_found', 'userdel: missing USERNAME\n', '1')
@@ -1156,6 +1167,8 @@ def _cmd_userdel(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_groupadd(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'groupadd':
+        if not can_administer(ctx.identity):
+            return _denied('groupadd: Permission denied.\n')
         gid = None
         operands: list = []
         skip = False
@@ -1196,6 +1209,8 @@ def _cmd_groupadd(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_groupdel(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'groupdel':
+        if not can_administer(ctx.identity):
+            return _denied('groupdel: Permission denied.\n')
         operands = _operands(ctx.args)
         if not operands:
             return ResponsePlan('command_not_found', 'groupdel: missing GROUP\n', '1')
@@ -1217,6 +1232,8 @@ def _cmd_groupdel(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_usermod(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'usermod':
+        if not can_administer(ctx.identity):
+            return _denied('usermod: Permission denied.\n')
         args = ctx.args
         append = any(a.startswith('-') and 'a' in a[1:] for a in args)
         groups_val = None

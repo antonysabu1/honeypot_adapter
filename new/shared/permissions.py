@@ -171,6 +171,17 @@ def can_chmod(fs, path: str, ident: Identity) -> bool:
     return node is not None and node.uid == ident.uid
 
 
+def can_administer(ident: Identity) -> bool:
+    """May change the virtual account databases (``/etc/passwd``, ``/etc/group``)
+    and create/remove home directories.
+
+    Account authority is a privileged operation: only virtual root may.  The
+    honeypot presents its accepted-anyone shell as root, so this is the same
+    identity that already bypasses file permissions.
+    """
+    return ident.is_root
+
+
 def can_chown(fs, path: str, ident: Identity, *, new_uid: int | None,
               new_gid: int | None) -> bool:
     """Root may change owner and group; a non-root owner may only chgrp to a

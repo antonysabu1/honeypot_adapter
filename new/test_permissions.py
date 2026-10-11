@@ -101,6 +101,34 @@ check("bob denied cp of a root file", "Permission denied" in run(fs, "cp /root/f
 check("bob denied mv of a root file", "Permission denied" in run(fs, "mv /root/flag.txt /tmp/x").content)
 check("bob denied ln into /etc", "Permission denied" in run(fs, "ln -s /etc/passwd /etc/link").content)
 
+print("== ln cannot launder an unreadable file (audit reproduction) ==")
+fs3 = scene()
+check("control: bob cannot cat the flag", "Permission denied" in run(fs3, "cat /root/flag.txt").content)
+ln = run(fs3, "ln /root/flag.txt /tmp/loot")
+check("hard link to an unreadable file is denied", "Permission denied" in ln.content)
+check("no loot file was created", not fs3.exists("/tmp/loot"))
+check("the flag is not disclosed through a link", "flag{" not in run(fs3, "cat /tmp/loot").content)
+check("ln of a readable file is still allowed", run(fs3, "ln /etc/hostname /tmp/host.name").status == "0")
+check("root may hard-link the flag", run(fs3, "ln /root/flag.txt /tmp/rootloot", "root").status == "0")
+
+print("== find does not disclose unlistable directories ==")
+fs4 = scene()
+found = run(fs4, "find -name flag.txt")
+check("bob's find omits /root", "/root/flag.txt" not in found.content)
+check("root's find still sees /root", "/root/flag.txt" in run(fs4, "find -name flag.txt", "root").content)
+
+print("== account administration requires virtual root ==")
+fs5 = scene()
+for cmd in ("useradd evil", "userdel bob", "groupadd evild",
+            "groupdel shared", "usermod -aG shared bob"):
+    r = run(fs5, cmd)
+    check(f"bob denied {cmd}", "Permission denied" in r.content and r.response_type != "session_end")
+check("no user was created", fs5.users.get("evil") is None)
+check("no group was created", not fs5.groups.exists("evild"))
+check("shared still exists", fs5.groups.exists("shared"))
+check("root may useradd", run(fs5, "useradd carol", "root").status == "0")
+check("root's useradd created the account", fs5.users.get("carol") is not None)
+
 print("== redirection writes ==")
 check("bob denied redirect into /etc", "Permission denied" in line(fs, "echo x > /etc/passwd").content)
 check("bob allowed redirect into /tmp", line(fs, "echo x > /tmp/bobout").status == "0")
