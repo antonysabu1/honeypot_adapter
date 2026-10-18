@@ -1,0 +1,470 @@
+"""Virtual process model and manager for the honeypot.
+
+Implements a stateful virtual process table that operates entirely against
+VirtualOS state without any host process interaction.  PID allocation is
+deterministic and collision‑safe; all state transitions (create, terminate,
+signal) modify the in‑memory table only.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+
+# ── PID allocation ────────────────────────────────────────────────────────
+
+# Baseline PID start: 1 init + a few system PIDs.  The exact numbers match
+# the "initial process tree" below so that `ps` output is reproducible.
+_INIT_PIDS = frozenset({1, 782, 812, 813})  # init, sshd, bash x2
+
+
+def _next_pid(processes: Dict[int, "VirtualProcess"]) -> int:
+    """Return the smallest positive integer not currently in *processes*."""
+    pid = 1
+    while pid in processes:
+        pid += 1
+    return pid
+
+
+# ── Virtual process state ─────────────────────────────────────────────────
+
+@dataclass
+class VirtualProcess:
+    """Represents a single virtual process in the honeypot's PID namespace."""
+
+    pid: int
+    ppid: int
+    uid: int
+    username: str
+    cmdline: str
+    state: str = "running"        # running | sleeping | stopped | zombie
+    start_time: float = field(
+        default_factory=lambda: datetime.now(timezone.utc).timestamp()
+    )
+    tty: str = ""                 # terminal association, e.g. "pts/0"
+    sessions: frozenset[str] = field(default_factory=frozenset)  # associated shell session ids
+
+
+# ── Virtual service model ─────────────────────────────────────────────────
+
+@dataclass
+class VirtualService:
+    """Represents a virtual service in the honeypot's service registry."""
+
+    name: str
+    description: str
+    state: str = "stopped"        # stopped | running | starting | stopping
+    enabled: bool = False         # whether the service is enabled to start auto‑matically
+    pid: int | None = None        # associated virtual PID, if running
+    listening_ports: frozenset[int] = field(default_factory=frozenset)
+    dependencies: frozenset[str] = field(default_factory=frozenset)  # service names this depends on
+    required_by: frozenset[str] = field(default_factory=frozenset)  # service names that depend on this one
+
+
+# ── Process manager ───────────────────────────────────────────────────────
+
+class ProcessManager:
+    """Manages the virtual process table.
+
+    Responsibilities
+    -----------------
+    * PID allocation (deterministic, collision‑safe)
+    * Creation / termination of virtual processes
+    * Lookup by PID or PPID
+    * Enumeration for ``ps``, ``pstree``, etc.
+    * Association of shell sessions with processes
+    * **Enforcement of maximum process count**
+    """
+
+    def __init__(self, initial_tree: Dict[int, VirtualProcess] | None = None,
+                 max_processes: int | None = None) -> None:
+        self._procs: Dict[int, VirtualProcess] = {}
+        self._max_processes = max_processes
+        # Seed with the initial process tree if supplied
+        if initial_tree:
+            for p in initial_tree.values():
+                self._procs[p.pid] = p
+        else:
+            # Boot the default minimal tree (init + sshd + bash)
+            self._boot_minimal_tree()
+
+    # ── PID allocation ─────────────────────────────────────────────────────
+
+    def new_pid(self) -> int:
+        """Return the smallest positive integer not currently in *processes*."""
+        pid = 1
+        while pid in self._procs:
+            pid += 1
+        return pid
+
+    # ── Boot a minimal process tree ─────────────────────────────────────────
+
+    def _boot_minimal_tree(self) -> None:
+        """Populate a tiny but realistic process tree.
+
+        init (PID 1) → sshd (PID 782) → bash (PID 812, 813).
+        """
+
+        init = VirtualProcess(pid=1, ppid=0, uid=0, username="root",
+                              cmdline="init [0]")
+        sshd = VirtualProcess(pid=782, ppid=1, uid=0, username="root",
+                              cmdline="/usr/sbin/sshd -D [ listening ]")
+        bash1 = VirtualProcess(pid=812, ppid=782, uid=0, username="root",
+                               cmdline="bash [shell]")
+        bash2 = VirtualProcess(pid=813, ppid=782, uid=0, username="root",
+                               cmdline="bash [shell]")
+
+        self._procs[init.pid] = init
+        self._procs[sshd.pid] = sshd
+        self._procs[bash1.pid] = bash1
+        self._procs[bash2.pid] = bash2
+
+    # ── Lookup ─────────────────────────────────────────────────────────────
+
+    def get(self, pid: int) -> VirtualProcess | None:
+        return self._procs.get(pid)
+
+    def get_by_ppid(self, ppid: int) -> list[VirtualProcess]:
+        return [p for p in self._procs.values() if p.ppid == ppid]
+
+    # ── Creation ───────────────────────────────────────────────────────────
+
+    def create(self, ppid: int, username: str, cmdline: str,
+               tty: str = "") -> VirtualProcess:
+        """Create a new virtual process and return it.
+
+        Raises ``RuntimeError`` if the maximum process count has been reached.
+        """
+        # Enforce process limit if set
+        if self._max_processes is not None and len(self._procs) >= self._max_processes:
+            raise RuntimeError(
+                f"Maximum process limit reached: {self._max_processes}"
+            )
+        pid = self.new_pid()
+        proc = VirtualProcess(
+            pid=pid,
+            ppid=ppid,
+            uid=0,
+            username=username,
+            cmdline=cmdline,
+            tty=tty,
+        )
+        self._procs[pid] = proc
+        return proc
+
+    # ── Termination ─────────────────────────────────────────────────────────
+
+    def terminate(self, pid: int) -> bool:
+        """Mark a process as zombie; return *True* if the PID existed."""
+        if pid not in self._procs:
+            return False
+        self._procs[pid].state = "zombie"
+        return True
+
+    def kill(self, pid: int, sig: str = "TERM") -> bool:
+        """Virtual kill – only changes state; never touches the host."""
+        if pid not in self._procs:
+            return False
+        # Transition through states: running → stopping → stopped → zombie
+        proc = self._procs[pid]
+        if proc.state == "running":
+            proc.state = "stopped"
+        elif proc.state in ("running", "stopped"):
+            proc.state = "zombie"
+        return True
+
+    # ── Session association ─────────────────────────────────────────────────
+
+    def associate_session(self, pid: int, session_id: str) -> bool:
+        if pid not in self._procs:
+            return False
+        proc = self._procs[pid]
+        self._procs[pid] = VirtualProcess(
+            pid=proc.pid,
+            ppid=proc.ppid,
+            uid=proc.uid,
+            username=proc.username,
+            cmdline=proc.cmdline,
+            state=proc.state,
+            tty=proc.tty,
+            sessions=frozenset({*proc.sessions, session_id}),
+        )
+        return True
+
+    def dissociate_session(self, pid: int, session_id: str) -> bool:
+        if pid not in self._procs:
+            return False
+        proc = self._procs[pid]
+        new_sessions = frozenset(s for s in proc.sessions if s != session_id)
+        self._procs[pid] = VirtualProcess(
+            pid=proc.pid,
+            ppid=proc.ppid,
+            uid=proc.uid,
+            username=proc.username,
+            cmdline=proc.cmdline,
+            state=proc.state,
+            tty=proc.tty,
+            sessions=new_sessions,
+        )
+        return True
+
+    # ── Enumeration ─────────────────────────────────────────────────────────
+
+    def all_procs(self) -> list[VirtualProcess]:
+        return sorted(self._procs.values(), key=lambda p: p.pid)
+
+    def pids(self) -> list[int]:
+        return sorted(self._procs.keys())
+
+    # ── Serialization (for debugging / introspection) ───────────────────────
+
+    def to_dict(self) -> dict:
+        return {p.pid: {"ppid": p.ppid, "uid": p.uid, "username": p.username,
+                        "cmdline": p.cmdline, "state": p.state,
+                        "tty": p.tty, "sessions": list(proc.sessions)}
+        for p in self._procs.values()}
+
+
+# ── Virtual service registry ───────────────────────────────────────────────
+
+class ServiceManager:
+    """Manages virtual services for the honeypot.
+
+    Services exist only inside VirtualOS.  Starting or stopping a service
+    updates virtual process and network state through APIs that later
+    components can consume.
+
+    **Also enforces a maximum service count** if ``max_services`` is set.
+    """
+
+    def __init__(self, process_manager: ProcessManager, max_services: int | None = None) -> None:
+        self._procs: ProcessManager = process_manager
+        self._max_services = max_services
+        # Deterministic baseline service set, initialized from persona/configuration
+        self._services: Dict[str, VirtualService] = self._boot_services()
+
+    # ── Baseline service set ────────────────────────────────────────────────
+
+    def _boot_services(self) -> Dict[str, VirtualService]:
+        """Initialize a deterministic set of services from the Linux persona.
+
+        Returns a dict mapping service name → VirtualService.
+        """
+
+        services: Dict[str, VirtualService] = {}
+
+        # sshd – the core daemon, always enabled and started
+        sshd = VirtualService(
+            name="sshd",
+            description="OpenBSD Secure Shell server",
+            state="running",
+            enabled=True,
+            pid=782,
+            listening_ports=frozenset({22}),
+        )
+        services["sshd"] = sshd
+
+        # cron – traditionally enabled and started
+        cron = VirtualService(
+            name="cron",
+            description="cron daemon",
+            state="running",
+            enabled=True,
+            pid=1234,
+            listening_ports=frozenset({}),
+        )
+        services["cron"] = cron
+
+        # rsyslog – logging daemon
+        rsyslog = VirtualService(
+            name="rsyslog",
+            description="system logging daemon",
+            state="running",
+            enabled=True,
+            pid=1235,
+            listening_ports=frozenset({}),
+        )
+        services["rsyslog"] = rsyslog
+
+        # crond – alternative cron
+        crond = VirtualService(
+            name="crond",
+            description="cron daemon",
+            state="stopped",
+            enabled=False,
+            pid=None,
+            listening_ports=frozenset({}),
+        )
+        services["crond"] = crond
+
+        # Set up dependency relationships
+        # crond is required_by by nothing initially
+        # sshd has no dependencies
+
+        return services
+
+    # ── Service lookup ─────────────────────────────────────────────────────
+
+    def get_service(self, name: str) -> VirtualService | None:
+        return self._services.get(name)
+
+    def has_service(self, name: str) -> bool:
+        return name in self._services
+
+    # ── Service state changes ───────────────────────────────────────────────
+
+    def start(self, name: str) -> str:
+        """Start a service.  Returns a status message.
+
+        If the service is already running, returns a message to that effect.
+        If the service depends on another that is not running, returns an error.
+        If the service limit would be exceeded, returns an error.
+        """
+
+        svc = self._services.get(name)
+        if svc is None:
+            return f"Failed to start service {name}: service does not exist."
+
+        if svc.state == "running":
+            return f"Failed to start service {name}: already running."
+
+        # Check dependencies
+        for dep in svc.dependencies:
+            dep_svc = self._services.get(dep)
+            if dep_svc is None or dep_svc.state != "running":
+                return f"Failed to start service {name}: dependency {dep} is not running."
+
+        # Check service limit
+        if self._max_services is not None:
+            running_count = sum(1 for s in self._services.values() if s.state == "running")
+            if running_count >= self._max_services:
+                return f"Failed to start service {name}: maximum service count ({self._max_services}) reached."
+
+        # If the service has an associated PID, update it to running
+        if svc.pid is not None:
+            self._procs.kill(svc.pid, "CONT")  # virtual wake‑up
+            svc.state = "running"
+        else:
+            # No PID yet – create a minimal associated process
+            pid = self._procs.new_pid()
+            cmdline = self._service_cmdline(name)
+            new_proc = self._procs.create(ppid=1, username="root", cmdline=cmdline)
+            svc.pid = pid
+
+        svc.state = "running"
+        return f"Started service {name}."
+
+    def stop(self, name: str) -> str:
+        """Stop a service.  Returns a status message.
+
+        If the service is already stopped, returns a message to that effect.
+        """
+
+        svc = self._services.get(name)
+        if svc is None:
+            return f"Failed to stop service {name}: service does not exist."
+
+        if svc.state == "stopped":
+            return f"Failed to stop service {name}: already stopped."
+
+        # Update the associated process state
+        if svc.pid is not None:
+            self._procs.kill(svc.pid)
+        svc.state = "stopped"
+        return f"Stopped service {name}."
+
+    def restart(self, name: str) -> str:
+        """Restart a service.  Returns a status message."""
+        stop_resp = self.stop(name)
+        if "already stopped" in stop_resp and "already running" not in stop_resp:
+            # If it wasn't running, just report that
+            return stop_resp
+        return self.start(name)
+
+    def enable(self, name: str) -> str:
+        """Enable a service so it starts automatically.  Returns a status message."""
+        svc = self._services.get(name)
+        if svc is None:
+            return f"Failed to enable service {name}: service does not exist."
+        svc.enabled = True
+        return f"Enabled service {name}."
+
+    def disable(self, name: str) -> str:
+        """Disable a service so it does not start automatically.  Returns a status message."""
+        svc = self._services.get(name)
+        if svc is None:
+            return f"Failed to disable service {name}: service does not exist."
+        svc.enabled = False
+        return f"Disabled service {name}."
+
+    def is_active(self, name: str) -> str:
+        """Return whether a service is active (running)."""
+        svc = self._services.get(name)
+        if svc is None:
+            return f"Failed to check service {name}: service does not exist."
+        if svc.state == "running":
+            return f"● {name} - active (running)"
+        return f"● {name} - inactive (dead)"
+
+    def is_enabled(self, name: str) -> str:
+        """Return whether a service is enabled. """
+        svc = self._services.get(name)
+        if svc is None:
+            return f"Failed to check service {name}: service does not exist."
+        if svc.enabled:
+            return f"● {name} - enabled"
+        return f"● {name} - disabled"
+
+    # ── Helper ──────────────────────────────────────────────────────────────
+
+    def _service_cmdline(self, name: str) -> str:
+        """Return a cmdline for the service's associated process."""
+        mapping = {
+            "sshd": "/usr/sbin/sshd -D",
+            "cron": "/usr/sbin/cron",
+            "rsyslog": "/usr/sbin/rsyslogd",
+        }
+        return mapping.get(name, "/usr/sbin/<unknown>-service")
+
+
+# ── Global instances ───────────────────────────────────────────────────────
+
+# The singleton service manager – initialised once the process manager exists.
+_service_manager: ServiceManager | None = None
+
+
+def get_service_manager(pm: Optional[ProcessManager] = None) -> ServiceManager:
+    """Return the global *ServiceManager*, initialising it with the given
+    *ProcessManager* (or booting one if *pm* is *None*)."""
+
+    global _service_manager
+    if _service_manager is None:
+        if pm is None:
+            pm = get_process_manager()
+        _service_manager = ServiceManager(pm, max_services=5)
+    return _service_manager
+
+
+def get_service_manager_ptr() -> ServiceManager | None:
+    """Return the current ServiceManager instance, or *None* if not yet set."""
+    return _service_manager
+
+
+# ── Global process manager ─────────────────────────────────────────────────
+
+_process_manager: ProcessManager | None = None
+
+
+def get_process_manager() -> "ProcessManager":
+    """Return the global ProcessManager, bootstrapping if necessary."""
+    global _process_manager
+    if _process_manager is None:
+        _process_manager = ProcessManager(max_processes=10)
+    return _process_manager
+
+
+def get_process_manager_ptr() -> ProcessManager | None:
+    """Return the current ProcessManager instance, or *None* if not yet set."""
+    return _process_manager
