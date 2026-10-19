@@ -542,7 +542,38 @@ class FakeFilesystem:
         f("authorized_keys", ssh_r,
           "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7FakeHoneypotKeyOnly root@honeypot\n",
           mode=0o600, uid=0, gid=0)
-
+        proc = d("proc", r)
+        f("version", proc,
+          "Linux version 5.15.0-105-generic (buildd@lcy02-amd64-106) "
+          "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld "
+          "(GNU Binutils for Ubuntu) 2.38) "
+          "#115-Ubuntu SMP Mon Apr 15 09:52:04 UTC 2024\n")
+        f("cpuinfo", proc,
+          "processor\t: 0\n"
+          "vendor_id\t: GenuineIntel\n"
+          "cpu family\t: 6\n"
+          "model\t\t: 165\n"
+          "model name\t: Intel(R) Core(TM) i7-10875H CPU @ 2.30GHz\n"
+          "stepping\t: 2\n"
+          "cpu MHz\t\t: 2294.000\n"
+          "cache size\t: 12288 KB\n"
+          "physical id\t: 0\n"
+          "siblings\t: 1\n"
+          "core id\t\t: 0\n"
+          "cpu cores\t: 1\n"
+          "apicid\t\t: 0\n"
+          "fpu\t\t: yes\n"
+          "fpu_exception\t: yes\n"
+          "cpuid level\t: 22\n"
+          "wp\t\t: yes\n"
+          "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca "
+          "cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx rdtscp lm "
+          "constant_tsc rep_good nopl cpuid pni ssse3 cx16 sse4_1 sse4_2 "
+          "popcnt aes xsave avx rdrand hypervisor lahf_lm\n"
+          "bogomips\t: 4588.00\n"
+          "clflush size\t: 64\n"
+          "address sizes\t: 39 bits physical, 48 bits virtual\n"
+          "power management:\n\n")
     # ── read-only queries ────────────────────────────────────────────────
 
     def exists(self, path: str) -> bool:
