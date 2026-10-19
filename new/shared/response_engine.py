@@ -1523,7 +1523,7 @@ def decide_response(
             if len(plan.content.encode("utf-8")) > max_out:
                 plan.content = plan.content.encode("utf-8")[:max_out].decode("utf-8", errors="replace")
             return plan
-    return ResponsePlan("command_not_found", f"bash: {cmd}: command not found\n", "127")
+    return ResponsePlan("command_not_found", f"bash: {ctx.base}: command not found\n", "127")
 
 def _base(p: str) -> str:
     return p.rsplit("/", 1)[-1] if "/" in p else p
@@ -1798,4 +1798,5 @@ def decide_line(
         status,
         redirect=",".join(redirects) if redirects else None,
     ), cwd
+
 
