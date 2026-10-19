@@ -82,7 +82,7 @@ def test_required_keys_consistency():
         passed += 1
 
     print(f"  test_required_keys_consistency: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def test_jsonl_malformed_line_resilience():
@@ -156,7 +156,7 @@ def test_jsonl_malformed_line_resilience():
     shutil.rmtree(tmpdir)
 
     print(f"  test_jsonl_malformed_line_resilience: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def test_sqlite_integrity_on_init():
@@ -201,7 +201,7 @@ def test_sqlite_integrity_on_init():
         print(f"  FAIL sqlite_integrity_on_init: setup error {exc}")
 
     print(f"  test_sqlite_integrity_on_init: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def test_sqlite_wal_and_concurrent_safety():
@@ -243,7 +243,7 @@ def test_sqlite_wal_and_concurrent_safety():
             pass
 
     print(f"  test_sqlite_wal_and_concurrent_safety: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def test_log_retention_respects_config():
@@ -300,7 +300,7 @@ def test_log_retention_respects_config():
     shutil.rmtree(tmpdir)
 
     print(f"  test_log_retention_respects_config: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def test_session_correlation_data():
@@ -353,7 +353,7 @@ def test_session_correlation_data():
             pass
 
     print(f"  test_session_correlation_data: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def test_event_schema_contains_mitre_when_provided():
@@ -390,7 +390,7 @@ def test_event_schema_contains_mitre_when_provided():
         print(f"    without: {event_without}")
 
     print(f"  test_event_schema_contains_mitre_when_provided: {passed} passed, {failed} failed")
-    return failed == 0
+    assert failed == 0
 
 
 def main():
