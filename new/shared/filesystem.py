@@ -427,6 +427,8 @@ class FakeFilesystem:
         f("group", etc, self._groups.group_text(), mode=0o644)
         f("hostname", etc, "honeypot\n")
         f("hosts", etc, "127.0.0.1 localhost\n127.0.1.1 honeypot\n")
+        f("machine-id", etc, "3f2504e04f8911d39a0c0305e82c3301\n")
+        f("issue", etc, "Ubuntu 22.04.3 LTS \\n \\l\n\n")
         f("os-release", etc,
           'PRETTY_NAME="Ubuntu 22.04.3 LTS"\nNAME="Ubuntu"\n'
           'VERSION_ID="22.0"\nVERSION="22.04.3 LTS (Jammy Jellyfish)"\n'
@@ -516,12 +518,6 @@ class FakeFilesystem:
         d("local", usr)
         run = d("run", r)
         d("sshd", run)
-        proc = d("proc", r)
-        f("version", proc,
-          "Linux version 5.15.0-105-generic (buildd@lcy02-amd64-106) "
-          "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld "
-          "(GNU Binutils for Ubuntu) 2.38) "
-          "#115-Ubuntu SMP Mon Apr 15 09:52:04 UTC 2024\n")
 
         # ── /root ──
         root = d("root", r, mode=0o700)
@@ -542,6 +538,7 @@ class FakeFilesystem:
         f("authorized_keys", ssh_r,
           "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7FakeHoneypotKeyOnly root@honeypot\n",
           mode=0o600, uid=0, gid=0)
+
         proc = d("proc", r)
         f("version", proc,
           "Linux version 5.15.0-105-generic (buildd@lcy02-amd64-106) "
@@ -574,6 +571,23 @@ class FakeFilesystem:
           "clflush size\t: 64\n"
           "address sizes\t: 39 bits physical, 48 bits virtual\n"
           "power management:\n\n")
+        f("meminfo", proc,
+          "MemTotal:        8166116 kB\n"
+          "MemFree:          423536 kB\n"
+          "MemAvailable:    3421896 kB\n"
+          "Buffers:           68924 kB\n"
+          "Cached:           2877196 kB\n"
+          "SwapCached:            0 kB\n"
+          "Active:          3421204 kB\n"
+          "Inactive:        2719272 kB\n"
+          "SwapTotal:       2097148 kB\n"
+          "SwapFree:        2097148 kB\n"
+          "Dirty:               192 kB\n"
+          "Writeback:              0 kB\n"
+          "AnonPages:       2912440 kB\n"
+          "Mapped:           412880 kB\n"
+          "Shmem:              8192 kB\n")
+
     # ── read-only queries ────────────────────────────────────────────────
 
     def exists(self, path: str) -> bool:
