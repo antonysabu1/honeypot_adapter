@@ -72,17 +72,23 @@ def main() -> None:
         # --- 1) Login: banner -> login: -> Password: -> shell prompt ---
         out = recv_until(sock, b"login: ")
         assert b"Welcome to Ubuntu 22.04 LTS" in out, f"bad banner: {out!r}"
+        # Like telnetd, the server takes over echo (character mode) up front.
+        assert b"\xff\xfb\x01" in out, "server did not announce WILL ECHO"
+        assert b"\xff\xfb\x03" in out, "server did not announce WILL SGA"
 
-        # --- 2) IAC negotiation (RFC 854): DO ECHO must be refused with WONT
-        # ECHO, and an SB ... SE subnegotiation must not desync the stream.
-        # Sent together with the credential lines so the replies are guaranteed
-        # to precede the next prompt (same data_received pass). ---
+        # --- 2) IAC negotiation (RFC 854): the client's DO ECHO agrees with what
+        # we announced, so it is not answered again (no WONT, no loop), and an
+        # SB ... SE subnegotiation must not desync the stream. Sent together
+        # with the credential lines so any reply precedes the next prompt. ---
         sock.sendall(b"\xff\xfd\x01" + b"admin\r\n")  # IAC DO ECHO + username
         out = recv_until(sock, b"Password: ")
-        assert b"\xff\xfc\x01" in out, "server did not reply WONT ECHO to DO ECHO"
+        assert b"\xff\xfc\x01" not in out, "server refused the echo it offered"
+        assert b"admin" in out, f"username was not echoed: {out!r}"
         sock.sendall(b"\xff\xfa\x18\x01\xff\xf0" + b"secret\r\n")  # IAC SB TTYPE SEND
         out = recv_until(sock, b"root@honeypot:~# ")
         assert b"Welcome to Ubuntu 22.04.3 LTS" in out, "missing MOTD after login"
+        # The password is typed blind, exactly as on a real login prompt.
+        assert b"secret" not in out, f"password was echoed: {out!r}"
 
         # --- 3) whoami reflects the login user, not hardcoded root ---
         sock.sendall(b"whoami\r\n")
@@ -153,6 +159,18 @@ def main() -> None:
         for action in ("connection_established", "login_attempt", "whoami",
                        "hacked", "exit", "connection_closed"):
             assert counts[action] == 1, f"{action} logged {counts[action]}x: {counts}"
+
+        # --- 10) a client that insists on local echo (DONT ECHO) gets WONT
+        # ECHO and is no longer echoed by the server ---
+        sock2 = connect_with_retry(port)
+        try:
+            recv_until(sock2, b"login: ")
+            sock2.sendall(b"\xff\xfe\x01" + b"bob\r\n")  # IAC DONT ECHO + username
+            out = recv_until(sock2, b"Password: ")
+            assert b"\xff\xfc\x01" in out, "DONT ECHO was not acknowledged"
+            assert b"bob" not in out, f"server echoed after DONT ECHO: {out!r}"
+        finally:
+            sock2.close()
 
         print("ALL TELNET INTEGRATION TESTS PASSED")
     finally:

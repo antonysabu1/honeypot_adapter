@@ -45,6 +45,10 @@ class TelnetSession:
         self._sb_option = None
         self._sb_payload = bytearray()
         self.term_type = None
+        # The server announces WILL ECHO + WILL SGA on connect (as telnetd
+        # does), so the client stops echoing locally and we echo instead —
+        # which is what lets the password be typed without being shown.
+        self._will_echo = True
 
     def handle_data(self, data: bytes):
         """Parse telnet framing (RFC 854) and feed complete lines to the shell.
@@ -117,31 +121,57 @@ class TelnetSession:
                 line = self.buffer.decode("utf-8", errors="ignore").strip()
                 self.buffer = b""
                 self.process_line(line)
+            elif byte in (8, 127):  # BS / DEL — erase one character
+                if self.buffer:
+                    # Drop a whole UTF-8 character, not just its last byte.
+                    end = len(self.buffer) - 1
+                    while end > 0 and (self.buffer[end] & 0xC0) == 0x80:
+                        end -= 1
+                    self.buffer = self.buffer[:end]
+                    self._echo(b"\b \b")
+            elif byte == 3:  # Ctrl-C in character mode — abandon the line
+                self.buffer = b""
+                if self.state == "shell":
+                    self.transport.write(("^C\r\n" + self.prompt).encode())
             else:
                 self.buffer += bytes([byte])
-                self.transport.write(bytes([byte]))  # echo back
+                self._echo(bytes([byte]))
             i += 1
         self._iac_buf = buf[i:]
 
+    def _echo(self, data: bytes) -> None:
+        """Echo typed input, except while the password is being entered."""
+        if self._will_echo and self.state != "password":
+            self.transport.write(data)
+
     def _handle_negotiation(self, cmd: int, option: int) -> None:
-        """Reply to telnet WILL/WONT/DO/DONT so strict clients don't hang."""
+        """Reply to telnet WILL/WONT/DO/DONT so strict clients don't hang.
+
+        Options we already announced are not acknowledged again (RFC 854:
+        only a change of state is answered), which keeps negotiation loop-free.
+        """
         if cmd == 253:  # DO <option> — client wants us to enable it
-            if option == 1:  # ECHO — we echo locally, so refuse
-                self.transport.write(b"\xff\xfc\x01")  # WONT ECHO
-            elif option == 3:  # SUPPRESS-GO-AHEAD
-                self.transport.write(b"\xff\xfb\x03")  # WILL SGA
+            if option == 1:  # ECHO — server-side echo
+                if not self._will_echo:
+                    self._will_echo = True
+                    self.transport.write(b"\xff\xfb\x01")  # WILL ECHO
+            elif option == 3:  # SUPPRESS-GO-AHEAD — announced on connect
+                pass
             else:
                 self.transport.write(b"\xff\xfc" + bytes([option]))  # WONT
+        elif cmd == 254:  # DONT <option>
+            if option == 1 and self._will_echo:
+                # The client insists on local echo; stop echoing ourselves.
+                self._will_echo = False
+                self.transport.write(b"\xff\xfc\x01")  # WONT ECHO
         elif cmd == 251:  # WILL <option> — client will enable it
-            if option == 1:
-                self.transport.write(b"\xff\xfd\x01")  # DO ECHO
-            elif option == 3:
+            if option == 3:
                 self.transport.write(b"\xff\xfd\x03")  # DO SGA
             elif option == 24:  # TERMINAL-TYPE — ask for the client's value
                 self.transport.write(b"\xff\xfa\x18\x01\xff\xf0")  # SB TTYPE SEND
-            else:
+            else:  # includes WILL ECHO: the client must not echo our output
                 self.transport.write(b"\xff\xfe" + bytes([option]))  # DONT
-        # WONT/DONT need no reply.
+        # WONT needs no reply.
 
     def _handle_subnegotiation(self, option, payload: bytes) -> None:
         """Record useful subnegotiation values (currently TERMINAL-TYPE)."""

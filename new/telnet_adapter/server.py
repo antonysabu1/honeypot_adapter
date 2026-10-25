@@ -50,6 +50,9 @@ class TelnetServer(asyncio.Protocol):
 
         # Ask a real Telnet client for its terminal type (RFC 1091).
         self.transport.write(b"\xff\xfd\x18")  # IAC DO TERMINAL-TYPE
+        # Character mode with server-side echo, like a real telnetd; this is
+        # what keeps the password from being shown as it is typed.
+        self.transport.write(b"\xff\xfb\x01\xff\xfb\x03")  # WILL ECHO, WILL SGA
         self.transport.write(LOGIN_BANNER.encode())
         self.transport.write(b"login: ")
         self.session = TelnetSession(self.transport, self.session_id, self.source_ip)
