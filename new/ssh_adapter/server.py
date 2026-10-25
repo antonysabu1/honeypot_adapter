@@ -40,23 +40,36 @@ def _get_host_key() -> paramiko.RSAKey:
     return _HOST_KEY
 
 
+class ChannelInfo:
+    """What one session channel has asked for so far (pty, shell or exec)."""
+
+    def __init__(self) -> None:
+        self.term = None
+        self.exec_command = None
+        # Set once the client sends its shell or exec request.
+        self.ready = threading.Event()
+
+
 class HoneypotSSHServer(paramiko.ServerInterface):
     def __init__(self, session_id, client_address, transport=None):
         self.session_id = session_id
         self.client_address = client_address
         self.transport = transport
-        self.event = threading.Event()
         self.username = None
-        self.term = None
-        self.exec_command = None
+        self.channels: dict[int, ChannelInfo] = {}
+        self._lock = threading.Lock()
 
-    def _client_metadata(self) -> dict:
+    def channel_info(self, channel) -> ChannelInfo:
+        with self._lock:
+            return self.channels.setdefault(channel.chanid, ChannelInfo())
+
+    def _client_metadata(self, channel=None) -> dict:
         """Protocol fingerprint data for the client's events."""
         metadata = {}
         version = _text(getattr(getattr(self, "transport", None), "remote_version", None))
         if version:
             metadata["client_version"] = version
-        term = _text(self.term)
+        term = _text(self.channel_info(channel).term) if channel is not None else None
         if term:
             metadata["terminal_type"] = term
         return metadata
@@ -105,19 +118,20 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         return "password,publickey"
 
     def check_channel_shell_request(self, channel):
-        self.event.set()
+        self.channel_info(channel).ready.set()
         return True
 
     def check_channel_exec_request(self, channel, command):
         # `ssh host "cmd"`: accepted like sshd would, answered by the fake shell.
-        self.exec_command = _text(command)
-        self.event.set()
+        info = self.channel_info(channel)
+        info.exec_command = _text(command)
+        info.ready.set()
         return True
 
     def check_channel_pty_request(
         self, channel, term, width, height, pixelwidth, pixelheight, modes
     ):
-        self.term = term
+        self.channel_info(channel).term = term
         return True
 
 
@@ -169,17 +183,18 @@ class SSHHandler(socketserver.BaseRequestHandler):
             if chan is None:
                 return
 
-            server.event.wait(10)
+            info = server.channel_info(chan)
+            info.ready.wait(10)
 
             shell = FakeSSHShell(
                 chan,
                 session_id,
                 self.client_address[0],
                 username=server.username or "root",
-                raw_metadata=server._client_metadata(),
+                raw_metadata=server._client_metadata(chan),
             )
-            if server.exec_command is not None:
-                shell.run_exec(server.exec_command)
+            if info.exec_command is not None:
+                shell.run_exec(info.exec_command)
             else:
                 shell.run()
         finally:
