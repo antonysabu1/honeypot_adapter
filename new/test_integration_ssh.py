@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import paramiko
 
 import shared.logger as logger_mod
+import ssh_adapter.server as ssh_server
 from ssh_adapter.server import SSHHandler
 
 
@@ -40,6 +41,9 @@ def recv_until(chan: paramiko.Channel, marker: bytes, timeout: float = 8.0) -> b
 def main() -> None:
     # Redirect honeypot logging to a temp file so the test never touches the
     # real logs/honeypot.jsonl. log_event() resolves these globals at call time.
+    # A connection with no open channel is dropped after IDLE_SECONDS; keep it
+    # short so the test does not wait out the production default.
+    ssh_server.IDLE_SECONDS = 1
     tmp_dir = Path(tempfile.mkdtemp(prefix="honeypot-ssh-test-"))
     logger_mod.LOG_DIR = tmp_dir
     logger_mod.LOG_FILE = tmp_dir / "honeypot.jsonl"
@@ -102,9 +106,9 @@ def main() -> None:
         # A clean finish reports exit status 0 (sshd does); a dropped
         # connection would leave it at -1 and the client sees a reset.
         assert chan.recv_exit_status() == 0, "exit did not report exit status 0"
-        client.get_transport().join(timeout=5)
+        client.get_transport().join(timeout=10)
         assert not client.get_transport().is_active(), (
-            "server left the connection open after exit"
+            "server left the connection open after the last channel closed"
         )
 
         # --- 8) events flowed through the shared logging pipeline ---
