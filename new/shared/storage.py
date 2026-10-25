@@ -26,17 +26,23 @@ DEFAULT_DB = Path(__file__).resolve().parent.parent / "logs" / "honeypot.db"
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 JSONL_PATH = LOG_DIR / "honeypot.jsonl"
 
+# Override this before calling get_storage() to redirect the DB (useful in tests).
+DB_FILE: "Path | None" = None
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id   TEXT PRIMARY KEY,
-    source_ip    TEXT NOT NULL,
-    protocol     TEXT NOT NULL,
-    started_at   TEXT NOT NULL,
-    closed_at    TEXT,
-    duration_ms  INTEGER,
-    username     TEXT DEFAULT 'root',
-    session_source TEXT DEFAULT 'protocol_native',
-    cwd           TEXT DEFAULT '/'
+    session_id      TEXT PRIMARY KEY,
+    source_ip       TEXT NOT NULL,
+    protocol        TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    last_seen       TEXT,
+    closed_at       TEXT,
+    duration_ms     INTEGER,
+    request_count   INTEGER NOT NULL DEFAULT 0,
+    distinct_actions INTEGER NOT NULL DEFAULT 0,
+    username        TEXT DEFAULT 'root',
+    session_source  TEXT DEFAULT 'protocol_native',
+    cwd             TEXT DEFAULT '/'
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -92,8 +98,7 @@ CREATE TABLE IF NOT EXISTS attack_techniques (
     tactic       TEXT NOT NULL,
     description  TEXT,
     sessions     INTEGER NOT NULL DEFAULT 1,
-    events       INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (technique_id, sessions)
+    events       INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -126,11 +131,24 @@ class StorageEngine:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._apply_migrations()
         # Verify integrity immediately after schema initialisation.
         self._verify_integrity()
         # Migrate: best-effort import of existing JSONL into SQLite.
         # Corrupt lines are skipped; startup never fails because of migration.
         self._migrate_jsonl()
+
+    def _apply_migrations(self) -> None:
+        """Add columns introduced after the initial schema (safe on existing DBs)."""
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        for col, defn in (
+            ("last_seen",        "TEXT"),
+            ("request_count",    "INTEGER NOT NULL DEFAULT 0"),
+            ("distinct_actions", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
+        self._conn.commit()
 
     def _verify_integrity(self) -> None:
         """Run PRAGMA integrity_check; raise RuntimeError on corruption."""
@@ -275,10 +293,10 @@ class StorageEngine:
              mitre_attack_id, mitre_technique_name, mitre_tactic,
              mitre_technique_name_secondary),
         )
-        # Update session start/end via the owning session
+        # Update last_seen + request_count on the owning session.
         if session_id:
             self._conn.execute(
-                "UPDATE sessions SET started_at=? WHERE session_id=?",
+                "UPDATE sessions SET last_seen=?, request_count=request_count+1 WHERE session_id=?",
                 (ts, session_id),
             )
         self._conn.commit()
@@ -493,10 +511,17 @@ _storage: StorageEngine | None = None
 
 
 def get_storage() -> StorageEngine:
-    """Return the global storage engine (lazy initialisation)."""
+    """Return the global storage engine (lazy initialisation).
+
+    Uses DB_FILE when set (tests can redirect it before the first call, or call
+    close_storage() to force a re-open at the new path).
+    """
     global _storage
-    if _storage is None:
-        _storage = StorageEngine()
+    target = Path(DB_FILE) if DB_FILE is not None else DEFAULT_DB
+    if _storage is None or _storage._db_path != target:
+        if _storage is not None:
+            _storage._close()
+        _storage = StorageEngine(target)
     return _storage
 
 
