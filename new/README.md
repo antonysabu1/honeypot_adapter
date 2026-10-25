@@ -51,7 +51,10 @@ fields: `event_id`, `timestamp`, `protocol`, `source_ip`, `session_id`, `action`
 `parameters`, `raw_metadata`, `session_source`, `response_status`,
 `response_type`). MITRE ATT&CK tags are nested under `raw_metadata["mitre"]`;
 protocol fingerprint data such as `client_version` and `terminal_type` is
-carried alongside it in `raw_metadata`.
+carried alongside it in `raw_metadata`. For a command, `parameters` holds the
+line as typed plus its `name` and `args`; a line of several commands
+(`;`, `&&`, `||`, `|`) also lists each under `segments`, and a redirected write
+target is recorded under `redirect`.
 
 ## Tests
 

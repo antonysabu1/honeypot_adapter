@@ -17,7 +17,7 @@ transports are interchangeable.
 
 import asyncssh
 
-from shared.events import build_event
+from shared.events import build_event, command_parameters
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
 from shared.response_engine import decide_response
@@ -104,7 +104,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
             self._write(b"\r\nlogout\r\n")
             log_event(build_event(
                 self.session_id, self.source_ip, "ssh", cmd,
-                {"command": cmd}, "0", "session_end", mitre=mitre,
+                command_parameters(cmd), "0", "session_end", mitre=mitre,
                 raw_metadata=self._raw_metadata(),
             ))
             self._exit_session(0)
@@ -114,9 +114,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         self._write(("\r\n" + content + "\r\n" + self.prompt).encode())
 
         # A redirected write target is intel: record it, never print it.
-        params = {"command": cmd}
-        if response.redirect:
-            params["redirect"] = response.redirect
+        params = command_parameters(cmd, response.redirect)
         log_event(build_event(
             self.session_id, self.source_ip, "ssh", cmd,
             params, response.status, response.response_type,
@@ -164,9 +162,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
             self._write(response.content.encode())
 
         # A redirected write target is intel: record it, never print it.
-        params = {"command": cmd}
-        if response is not None and response.redirect:
-            params["redirect"] = response.redirect
+        params = command_parameters(cmd, response.redirect if response else None)
         log_event(build_event(
             self.session_id, self.source_ip, "ssh", cmd,
             params, response.status if response else "0",

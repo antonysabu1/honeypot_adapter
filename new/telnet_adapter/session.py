@@ -1,4 +1,4 @@
-from shared.events import build_event
+from shared.events import build_event, command_parameters
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
 from shared.response_engine import decide_response
@@ -235,9 +235,7 @@ class TelnetSession:
             self.transport.write(("\r\n" + content + "\r\n" + self.prompt).encode())
 
             # A redirected write target is intel: record it, never print it.
-            params = {"command": line}
-            if response.redirect:
-                params["redirect"] = response.redirect
+            params = command_parameters(line, response.redirect)
             self._log(line, response.status, response.response_type, mitre, params)
 
     def _raw_metadata(self) -> dict:
@@ -254,7 +252,7 @@ class TelnetSession:
             source_ip=self.source_ip,
             protocol="telnet",
             action=action,
-            parameters=parameters if parameters is not None else {"command": action},
+            parameters=parameters if parameters is not None else command_parameters(action),
             response_status=response_status,
             response_type=response_type,
             mitre=mitre,

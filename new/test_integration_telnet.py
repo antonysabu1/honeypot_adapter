@@ -137,6 +137,9 @@ def main() -> None:
         assert "command_not_found" in resp_types, "no command_not_found event"
         assert "session_end" in resp_types, "no session_end event for exit"
         assert all(e["protocol"] == "telnet" for e in events), "non-telnet event found"
+        cat_event = next(e for e in events if e["action"] == "cat /etc/hosts")
+        assert cat_event["parameters"]["name"] == "cat", cat_event["parameters"]
+        assert cat_event["parameters"]["args"] == ["/etc/hosts"], cat_event["parameters"]
 
         # Adapter contract: exactly eleven top-level keys per event, and each
         # interaction logged once (no "pending" placeholder event).

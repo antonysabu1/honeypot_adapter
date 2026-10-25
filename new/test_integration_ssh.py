@@ -115,6 +115,9 @@ def main() -> None:
         assert "command_not_found" in resp_types, "no command_not_found event"
         assert "session_end" in resp_types, "no session_end event for exit"
         assert all(e["protocol"] == "ssh" for e in events), "non-ssh event found"
+        ls_event = next(e for e in events if e["action"] == "ls /etc")
+        assert ls_event["parameters"]["name"] == "ls", ls_event["parameters"]
+        assert ls_event["parameters"]["args"] == ["/etc"], ls_event["parameters"]
 
         # Adapter contract: exactly eleven top-level keys per event, and each
         # interaction logged once (no "pending" placeholder event).
@@ -161,6 +164,8 @@ def main() -> None:
         exec_events = [e for e in events if e["action"] in ("uname -a", "cat /nonexistent")]
         assert len(exec_events) == 2, f"exec commands not logged once each: {exec_events}"
         assert all(set(e) == contract for e in exec_events), "exec event breaks contract"
+        cat = next(e for e in exec_events if e["action"] == "cat /nonexistent")
+        assert cat["parameters"]["args"] == ["/nonexistent"], cat["parameters"]
 
         print("ALL SSH INTEGRATION TESTS PASSED")
     finally:

@@ -155,6 +155,9 @@ async def run_asyncssh_tests():
             assert expected in resp_types, f"missing response_type {expected!r}"
 
         assert all(e["protocol"] == "ssh" for e in events), "non-ssh event found"
+        cd_event = next(e for e in events if e["action"] == "cd /tmp")
+        assert cd_event["parameters"]["name"] == "cd", cd_event["parameters"]
+        assert cd_event["parameters"]["args"] == ["/tmp"], cd_event["parameters"]
 
         # Adapter contract: exactly eleven top-level keys, each interaction once.
         contract = {

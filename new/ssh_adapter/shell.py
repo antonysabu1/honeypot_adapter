@@ -1,4 +1,4 @@
-from shared.events import build_event
+from shared.events import build_event, command_parameters
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
 from shared.response_engine import decide_response
@@ -47,7 +47,7 @@ class FakeSSHShell:
             source_ip=self.source_ip,
             protocol="ssh",
             action=cmd,
-            parameters=parameters if parameters is not None else {"command": cmd},
+            parameters=parameters if parameters is not None else command_parameters(cmd),
             response_status=response_status,
             response_type=response_type,
             mitre=mitre,
@@ -85,9 +85,7 @@ class FakeSSHShell:
         self.channel.send(("\r\n" + content + "\r\n" + self.prompt).encode())
 
         # A redirected write target is intel: record it, never print it.
-        params = {"command": cmd}
-        if response.redirect:
-            params["redirect"] = response.redirect
+        params = command_parameters(cmd, response.redirect)
         self._log(cmd, response.status, response.response_type, mitre, params)
 
     def _decide(self, cmd: str):
@@ -120,9 +118,7 @@ class FakeSSHShell:
         else:
             if response.content:
                 self.channel.sendall(response.content.encode())
-            params = {"command": cmd}
-            if response.redirect:
-                params["redirect"] = response.redirect
+            params = command_parameters(cmd, response.redirect)
             self._log(cmd, response.status, response.response_type, mitre, params)
             try:
                 exit_code = int(response.status)
