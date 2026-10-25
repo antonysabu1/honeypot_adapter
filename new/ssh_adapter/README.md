@@ -30,7 +30,10 @@ fake shell over the VirtualOS filesystem. Every command is answered by
 `shared.response_engine.decide_response()` and logged through
 `shared.logger.log_event()` with the shared eleven-field event schema.
 
-Interactive shells and `ssh host "cmd"` exec requests are both served. One
-connection is one session: it may open up to 10 channels (for example with
-OpenSSH connection sharing), all sharing the session's directory and
-environment, and it is dropped 30 seconds after its last channel closes.
+Interactive shells and `ssh host "cmd"` exec requests are both served. The
+connection behaves like sshd's: it stays up until the client hangs up (also
+with no session open, so OpenSSH connection sharing works), allows up to 10
+simultaneous sessions (`MaxSessions`; the 11th is "administratively
+prohibited"), and every session on it shares one directory and environment.
+As a honeypot safeguard a connection is closed after `limits.session_timeout`
+(1 hour by default).
