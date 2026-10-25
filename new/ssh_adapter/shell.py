@@ -119,7 +119,8 @@ class FakeSSHShell:
             exit_code = 0
         else:
             if response.content:
-                self.channel.sendall(response.content.encode())
+                # A command's output always ends in a newline.
+                self.channel.sendall(response.content.rstrip("\n").encode() + b"\n")
             params = command_parameters(cmd, response.redirect)
             self._log(cmd, response.status, response.response_type, mitre, params)
             try:
