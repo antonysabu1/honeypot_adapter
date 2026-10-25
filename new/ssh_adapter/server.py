@@ -1,5 +1,6 @@
 import socketserver
 import threading
+import time
 from pathlib import Path
 
 # paramiko is a required third-party dependency. It is installed (v5.0.0).
@@ -12,6 +13,11 @@ from shared.connection_manager import can_create_session, register_session, unre
 from ssh_adapter.shell import FakeSSHShell
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
+
+# Channels one connection may have open at once (OpenSSH's default is 10).
+MAX_CHANNELS = 10
+# A connection with no open channel is dropped after this many seconds.
+IDLE_SECONDS = 30
 
 _HOST_KEY = None
 
@@ -57,6 +63,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         self.transport = transport
         self.username = None
         self.channels: dict[int, ChannelInfo] = {}
+        self.open_channels = 0
         self._lock = threading.Lock()
 
     def channel_info(self, channel) -> ChannelInfo:
@@ -75,9 +82,11 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         return metadata
 
     def check_channel_request(self, kind, chanid):
-        if kind == "session":
-            return paramiko.OPEN_SUCCEEDED
-        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        if kind != "session":
+            return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        if self.open_channels >= MAX_CHANNELS:
+            return paramiko.OPEN_FAILED_RESOURCE_SHORTAGE
+        return paramiko.OPEN_SUCCEEDED
 
     def check_auth_password(self, username, password):
         self.username = username
@@ -136,6 +145,31 @@ class HoneypotSSHServer(paramiko.ServerInterface):
 
 
 class SSHHandler(socketserver.BaseRequestHandler):
+    def _serve_channel(self, server, chan, session_id):
+        """Run one channel's shell or exec; channels share the session."""
+        try:
+            info = server.channel_info(chan)
+            info.ready.wait(10)
+            shell = FakeSSHShell(
+                chan,
+                session_id,
+                self.client_address[0],
+                username=server.username or "root",
+                raw_metadata=server._client_metadata(chan),
+            )
+            if info.exec_command is not None:
+                shell.run_exec(info.exec_command)
+            else:
+                shell.run()
+        finally:
+            with server._lock:
+                server.open_channels -= 1
+            server.channels.pop(chan.chanid, None)
+            try:
+                chan.close()
+            except Exception:
+                pass
+
     def handle(self):
         transport = paramiko.Transport(self.request)
         transport.local_version = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"
@@ -183,20 +217,27 @@ class SSHHandler(socketserver.BaseRequestHandler):
             if chan is None:
                 return
 
-            info = server.channel_info(chan)
-            info.ready.wait(10)
-
-            shell = FakeSSHShell(
-                chan,
-                session_id,
-                self.client_address[0],
-                username=server.username or "root",
-                raw_metadata=server._client_metadata(chan),
-            )
-            if info.exec_command is not None:
-                shell.run_exec(info.exec_command)
-            else:
-                shell.run()
+            workers = []
+            idle_since = time.monotonic()
+            while chan is not None or transport.is_active():
+                if chan is not None:
+                    worker = threading.Thread(
+                        target=self._serve_channel,
+                        args=(server, chan, session_id),
+                        daemon=True,
+                    )
+                    with server._lock:
+                        server.open_channels += 1
+                    worker.start()
+                    workers.append(worker)
+                chan = transport.accept(1)
+                workers = [w for w in workers if w.is_alive()]
+                if workers or chan is not None:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since > IDLE_SECONDS:
+                    break
+            for worker in workers:
+                worker.join(timeout=5)
         finally:
             log_event(
                 _build_event(
