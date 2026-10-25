@@ -126,6 +126,31 @@ async def run_asyncssh_tests():
         conn2.close()
         await asyncio.wait_for(conn2.wait_closed(), 5)
 
+        # --- 2b) like sshd: sessions come and go on one connection, and the
+        # 11th simultaneous one is refused ---
+        conn4 = await asyncssh.connect(
+            "127.0.0.1", port=port, username="idle", password="idle",
+            known_hosts=None, client_keys=None,
+        )
+        await asyncio.sleep(2.5)  # authenticated, no session: still up
+        assert (await conn4.run("pwd")).stdout.strip() == "/root"
+        await asyncio.sleep(2.5)  # the session ended: still up, and reusable
+        assert (await conn4.run("pwd")).stdout.strip() == "/root"
+        held = [
+            await conn4.create_process(term_type="xterm", encoding=None)
+            for _ in range(10)
+        ]
+        try:
+            await conn4.create_process(term_type="xterm", encoding=None)
+        except asyncssh.ChannelOpenError:
+            pass
+        else:
+            raise AssertionError("11th simultaneous session was accepted")
+        for held_proc in held:
+            held_proc.stdin.write_eof()
+        conn4.close()
+        await asyncio.wait_for(conn4.wait_closed(), 5)
+
         # --- 3) public-key auth path also logs ---
         client_key = asyncssh.generate_private_key("ssh-ed25519")
         conn3 = await asyncssh.connect(
@@ -169,10 +194,10 @@ async def run_asyncssh_tests():
             f"event schema is not the 11-key contract: {sorted(events[0])}"
         )
         assert "pending" not in resp_types, "duplicate 'pending' event logged"
-        # conn1 + conn2 authenticate with a password; conn3 with a public key.
+        # conn1, conn2 and conn4 authenticate with a password; conn3 with a public key.
         # A client may offer its key more than once, so pubkey_attempt is not
         # pinned to an exact count - only that no "pending" duplicate appears.
-        assert actions.count("login_attempt") == 2, actions
+        assert actions.count("login_attempt") == 3, actions
         assert "pubkey_attempt" in actions, actions
 
         print("ALL ASYNCSSH INTEGRATION TESTS PASSED")
