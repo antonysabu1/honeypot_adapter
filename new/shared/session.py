@@ -1,6 +1,9 @@
 import uuid
 from datetime import datetime, timezone
 
+from shared.connection_manager import forget_session_commands
+from shared.session_state import drop_state
+
 
 def create_session_id() -> str:
     return str(uuid.uuid4())
@@ -24,6 +27,9 @@ class SessionTracker:
     def end_session(self, session_id: str) -> None:
         if session_id in self._sessions:
             del self._sessions[session_id]
+        # The core owns per-session VirtualOS state; release it with the session.
+        drop_state(session_id)
+        forget_session_commands(session_id)
 
     def get_session(self, session_id: str) -> "dict | None":
         return self._sessions.get(session_id)

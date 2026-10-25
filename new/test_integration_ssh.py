@@ -12,6 +12,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import paramiko
 
 import shared.logger as logger_mod
+import ssh_adapter.server as ssh_server
 from ssh_adapter.server import SSHHandler
 
 
@@ -35,6 +37,17 @@ def recv_until(chan: paramiko.Channel, marker: bytes, timeout: float = 8.0) -> b
             )
         buf += chunk
     return buf
+
+
+def wait_for_event(action: str, count: int, timeout: float = 5.0) -> None:
+    """Wait until `count` events with this action have been logged."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        lines = logger_mod.LOG_FILE.read_text(encoding="utf-8").splitlines()
+        if sum(json.loads(l)["action"] == action for l in lines if l.strip()) >= count:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"no {action!r} event x{count} within {timeout}s")
 
 
 def main() -> None:
@@ -99,6 +112,12 @@ def main() -> None:
         assert b"logout" in out
         chan.settimeout(5)
         assert chan.recv(4096) == b"", "channel did not close after exit"
+        # A clean finish reports exit status 0 (sshd does); a dropped
+        # connection would leave it at -1 and the client sees a reset.
+        assert chan.recv_exit_status() == 0, "exit did not report exit status 0"
+        # The connection ends when the client hangs up, as with sshd.
+        client.close()
+        wait_for_event("connection_closed", 1)
 
         # --- 8) events flowed through the shared logging pipeline ---
         events = [
@@ -115,6 +134,9 @@ def main() -> None:
         assert "command_not_found" in resp_types, "no command_not_found event"
         assert "session_end" in resp_types, "no session_end event for exit"
         assert all(e["protocol"] == "ssh" for e in events), "non-ssh event found"
+        ls_event = next(e for e in events if e["action"] == "ls /etc")
+        assert ls_event["parameters"]["name"] == "ls", ls_event["parameters"]
+        assert ls_event["parameters"]["args"] == ["/etc"], ls_event["parameters"]
 
         # Adapter contract: exactly eleven top-level keys per event, and each
         # interaction logged once (no "pending" placeholder event).
@@ -131,6 +153,111 @@ def main() -> None:
         for action in ("connection_established", "login_attempt", "whoami",
                        "hacked", "exit", "connection_closed"):
             assert counts[action] == 1, f"{action} logged {counts[action]}x: {counts}"
+
+        # --- 9) exec channel (`ssh host "cmd"`) is answered and logged ---
+        # One exec per connection, like `ssh host "cmd"` from a real client.
+        for cmd, expected_out, expected_rc in (
+            ("uname -a", b"Linux honeypot", 0),
+            ("cat /nonexistent", b"No such file or directory", 1),
+        ):
+            exec_client = paramiko.SSHClient()
+            exec_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                exec_client.connect(
+                    "127.0.0.1", port=port, username="bot", password="bot",
+                    look_for_keys=False, allow_agent=False, timeout=10,
+                )
+                _, stdout, stderr = exec_client.exec_command(cmd, timeout=10)
+                out = stdout.read() + stderr.read()
+                rc = stdout.channel.recv_exit_status()
+                assert expected_out in out, f"exec {cmd!r} output: {out!r}"
+                assert out.endswith(b"\n"), f"exec {cmd!r} output lacks a newline: {out!r}"
+                assert rc == expected_rc, f"exec {cmd!r} exit status {rc}"
+            finally:
+                exec_client.close()
+
+        # --- 10) several channels on ONE connection share the session ---
+        multi = paramiko.SSHClient()
+        multi.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            multi.connect(
+                "127.0.0.1", port=port, username="mux", password="mux",
+                look_for_keys=False, allow_agent=False, timeout=10,
+            )
+
+            def run(cmd):
+                _, stdout, stderr = multi.exec_command(cmd, timeout=10)
+                return (stdout.read() + stderr.read()).decode(), stdout.channel.recv_exit_status()
+
+            out, rc = run("cd /etc")
+            assert rc == 0, (out, rc)
+            out, rc = run("pwd")  # a later channel sees the earlier one's cd
+            assert out.strip() == "/etc" and rc == 0, (out, rc)
+            run("export MUX_VAR=7")
+            out, _ = run("printenv MUX_VAR")
+            assert out.strip() == "7", out
+            # An interactive shell on the same connection starts in /etc.
+            shell = multi.invoke_shell()
+            out = recv_until(shell, b"# ")
+            assert b"root@honeypot:/etc# " in out, f"new channel prompt: {out!r}"
+            shell.send(b"exit\r")
+            recv_until(shell, b"logout")
+            # A different connection is a different session.
+            other = paramiko.SSHClient()
+            other.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            other.connect(
+                "127.0.0.1", port=port, username="other", password="other",
+                look_for_keys=False, allow_agent=False, timeout=10,
+            )
+            try:
+                _, stdout, _ = other.exec_command("pwd", timeout=10)
+                assert stdout.read().decode().strip() == "/root", "state leaked"
+            finally:
+                other.close()
+        finally:
+            multi.close()
+
+        # --- 11) like sshd: the connection outlives its sessions, and a session
+        # can be opened again later; the 11th simultaneous one is refused ---
+        live = paramiko.SSHClient()
+        live.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            live.connect(
+                "127.0.0.1", port=port, username="idle", password="idle",
+                look_for_keys=False, allow_agent=False, timeout=10,
+            )
+            transport = live.get_transport()
+            time.sleep(2.5)  # authenticated, no session yet: still up
+            assert transport.is_active(), "connection dropped with no session open"
+            _, stdout, _ = live.exec_command("pwd", timeout=10)
+            stdout.read()
+            time.sleep(2.5)  # the only session has ended: still up
+            assert transport.is_active(), "connection dropped after its last session"
+            _, stdout, _ = live.exec_command("pwd", timeout=10)
+            assert stdout.read().strip() == b"/root", "later session not served"
+
+            held = [transport.open_session() for _ in range(ssh_server.MAX_CHANNELS)]
+            try:
+                transport.open_session()
+            except paramiko.ChannelException as exc:
+                assert exc.code == paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED, exc
+            else:
+                raise AssertionError("11th simultaneous session was accepted")
+            for chan_ in held:
+                chan_.close()
+        finally:
+            live.close()
+
+        events = [
+            json.loads(line)
+            for line in logger_mod.LOG_FILE.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        exec_events = [e for e in events if e["action"] in ("uname -a", "cat /nonexistent")]
+        assert len(exec_events) == 2, f"exec commands not logged once each: {exec_events}"
+        assert all(set(e) == contract for e in exec_events), "exec event breaks contract"
+        cat = next(e for e in exec_events if e["action"] == "cat /nonexistent")
+        assert cat["parameters"]["args"] == ["/nonexistent"], cat["parameters"]
 
         print("ALL SSH INTEGRATION TESTS PASSED")
     finally:

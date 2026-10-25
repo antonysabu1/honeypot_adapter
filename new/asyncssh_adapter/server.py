@@ -14,13 +14,28 @@ from pathlib import Path
 import asyncssh
 
 from asyncssh_adapter.shell import AsyncSSHShell
+from shared.connection_manager import (
+    can_create_session,
+    register_session,
+    unregister_session,
+)
 from shared.events import build_event
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
 
 HOST_KEY_FILE = Path(__file__).resolve().parent / "host_key_asyncssh"
 
+# Sessions one connection may have open at once: sshd's MaxSessions (default 10).
+MAX_SESSIONS = 10
 SERVER_VERSION = "OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"
+
+
+def _text(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _load_host_key():
@@ -49,6 +64,16 @@ class HoneypotSSHServer(asyncssh.SSHServer):
         self._ip = "0.0.0.0"
         self._session_id = None
         self._username = None
+        self._client_version = None
+        self._rejected = False
+        self._registered = False
+        self._open_sessions = 0
+
+    def _client_metadata(self) -> dict:
+        metadata = {}
+        if self._client_version:
+            metadata["client_version"] = self._client_version
+        return metadata
 
     # ------------------------------------------------------------------
     # Connection lifecycle / telemetry
@@ -58,7 +83,26 @@ class HoneypotSSHServer(asyncssh.SSHServer):
         peer = conn.get_extra_info("peername") or ("0.0.0.0", 0)
         self._ip = peer[0]
         self._session_id = create_session_id()
+
+        # ENTRY GATE: Check session limits before creating a session.
+        if not can_create_session("ssh", self._ip):
+            self._rejected = True
+            log_event(build_event(
+                session_id=self._session_id,
+                source_ip=self._ip,
+                protocol="ssh",
+                action="session_limit_reached",
+                parameters={"reason": "max_sessions_reached"},
+                response_status="0",
+                response_type="session_rejected",
+                raw_metadata=self._client_metadata(),
+            ))
+            conn.close()
+            return
+
         session_tracker.start_session(self._ip, "ssh", self._session_id)
+        register_session("ssh", self._ip)
+        self._registered = True
 
         log_event(build_event(
             session_id=self._session_id,
@@ -68,10 +112,11 @@ class HoneypotSSHServer(asyncssh.SSHServer):
             parameters={},
             response_status="0",
             response_type="banner_sent",
+            raw_metadata=self._client_metadata(),
         ))
 
     def connection_lost(self, exc) -> None:
-        if self._session_id is None:
+        if self._session_id is None or self._rejected:
             return
         log_event(build_event(
             session_id=self._session_id,
@@ -81,7 +126,11 @@ class HoneypotSSHServer(asyncssh.SSHServer):
             parameters={},
             response_status="0",
             response_type="session_end",
+            raw_metadata=self._client_metadata(),
         ))
+        if self._registered:
+            unregister_session("ssh", self._ip)
+            self._registered = False
         session_tracker.end_session(self._session_id)
 
     # ------------------------------------------------------------------
@@ -95,6 +144,10 @@ class HoneypotSSHServer(asyncssh.SSHServer):
         client straight in". The methods actually offered are declared by
         password_auth_supported() / public_key_auth_supported() below.
         """
+        # The client banner is only known once the version exchange is done,
+        # which is after connection_made() but before begin_auth().
+        if self._conn is not None:
+            self._client_version = _text(self._conn.get_extra_info("client_version"))
         return True
 
     def password_auth_supported(self) -> bool:
@@ -113,6 +166,7 @@ class HoneypotSSHServer(asyncssh.SSHServer):
             parameters={"username": username, "password": password},
             response_status="authenticated",
             response_type="fake_auth_success",
+            raw_metadata=self._client_metadata(),
         ))
         return True
 
@@ -130,6 +184,7 @@ class HoneypotSSHServer(asyncssh.SSHServer):
             parameters={"username": username, "fingerprint": fingerprint},
             response_status="authenticated",
             response_type="fake_auth_success",
+            raw_metadata=self._client_metadata(),
         ))
         return True
 
@@ -138,13 +193,21 @@ class HoneypotSSHServer(asyncssh.SSHServer):
     # ------------------------------------------------------------------
     def session_requested(self) -> tuple:
         """Open a raw-bytes session channel + AsyncSSHShell for each channel."""
+        if self._open_sessions >= MAX_SESSIONS:
+            return False  # sshd: "administratively prohibited"
+        self._open_sessions += 1
         chan = self._conn.create_server_channel(encoding=None)
         shell = AsyncSSHShell(
             session_id=self._session_id,
             source_ip=self._ip,
             username=self._username or "root",
+            client_version=self._client_version,
+            on_close=self._session_closed,
         )
         return chan, shell
+
+    def _session_closed(self) -> None:
+        self._open_sessions = max(0, self._open_sessions - 1)
 
 
 async def create_server(host="0.0.0.0", port=2222, **kwargs):

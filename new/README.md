@@ -49,7 +49,12 @@ All events are written to logs/honeypot.jsonl.
 Each line is a JSON object with the shared schema (exactly the eleven contract
 fields: `event_id`, `timestamp`, `protocol`, `source_ip`, `session_id`, `action`,
 `parameters`, `raw_metadata`, `session_source`, `response_status`,
-`response_type`). MITRE ATT&CK tags are nested under `raw_metadata["mitre"]`.
+`response_type`). MITRE ATT&CK tags are nested under `raw_metadata["mitre"]`;
+protocol fingerprint data such as `client_version` and `terminal_type` is
+carried alongside it in `raw_metadata`. For a command, `parameters` holds the
+line as typed plus its `name` and `args`; a line of several commands
+(`;`, `&&`, `||`, `|`) also lists each under `segments`, and a redirected write
+target is recorded under `redirect`.
 
 ## Tests
 
@@ -77,7 +82,7 @@ python3 -m venv .venv
 ## Simulation & isolation guarantee
 
 SSH and Telnet are answered entirely inside the VirtualOS. Every command goes
-through `shared.response_engine.decide_response()` / `decide_line()` against an
+through `shared.response_engine.decide_response()` against an
 in-memory `FakeFilesystem`, virtual users/groups/permissions, and virtual
 services. No `old/` reference code is invoked.
 
@@ -94,7 +99,8 @@ only what is genuinely protocol-specific.
 
 | Module | Owns |
 |---|---|
-| `shared/response_engine.py` | One handler per command in `_ROUTES` (tried in order), plus `decide_line()` for `;` / `&&` / `||` lines |
+| `shared/response_engine.py` | `decide_response(protocol, session_id, action, parameters)`: the **single decision seam** every transport calls, for plain commands and `;` / `&&` / `\|\|` / `\|` / redirection lines alike. One handler per command in `_ROUTES` (tried in order) |
+| `shared/session_state.py` | Each session's VirtualOS state (fake filesystem + shell state), owned by the core, keyed by `session_id`, released when the session ends |
 | `shared/shell.py` | Banner, prompt, argument split, keystroke handling (`LineEditor`), `cd` policy (`resolve_cd`) |
 | `shared/shell_syntax.py` | Pipelines and redirections (`>`, `>>`, `2>`, `2>&1`, `&>`, `<`, `/dev/null`): parsing, filter stages, which stream is hidden. Pure — it knows no commands, so the engine still runs every stage. The engine's `grep`/`head`/`tail`/`cut`/`sort`/`uniq`/`wc` handlers call these same filters |
 | `shared/events.py` | The single telemetry event builder |
@@ -105,7 +111,8 @@ only what is genuinely protocol-specific.
 | `asyncssh_adapter/` | AsyncSSH transport: server + shell, selected with `HONEYPOT_SSH_ADAPTER=asyncssh` |
 
 Data flows one way: transport reads bytes → `LineEditor` → command line →
-`decide_line()` / `decide_response()` → `ResponsePlan` → transport renders it
-and emits one event through `shared.events.build_event`. The transport owns the
-session's cwd; the sequencer borrows it for the length of a line and hands the
-resulting value back.
+`decide_response()` → `ResponsePlan` → transport renders it and emits one
+event through `shared.events.build_event`. The core owns each session's state;
+the plan carries the resulting cwd, which the transport only uses to draw its
+prompt. When the Control Engine arrives it replaces the inside of
+`decide_response()`, and no transport changes.

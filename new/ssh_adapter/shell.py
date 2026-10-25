@@ -1,19 +1,13 @@
-from shared.events import build_event
-from shared.filesystem import FakeFilesystem
+from shared.events import build_event, command_parameters
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
-from shared.response_engine import (
-    decide_line,
-    decide_response,
-    has_shell_syntax,
-)
-from shared.shell_state import VirtualShellState
+from shared.response_engine import decide_response
+from shared.session_state import session_cwd
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
     parse_args,
     prompt_for,
-    resolve_cd,
 )
 
 
@@ -25,27 +19,17 @@ class FakeSSHShell:
     the telemetry it emits.
     """
 
-    def __init__(self, channel, session_id, source_ip, username="root"):
+    def __init__(self, channel, session_id, source_ip, username="root",
+                 raw_metadata=None):
         self.channel = channel
         self.session_id = session_id
         self.source_ip = source_ip
         self.username = username or "root"
-        # SAFETY: No real file access — uses FakeFilesystem
-        self.fs = FakeFilesystem()
-        self.current_dir = "/root"
-        self.shell_state = VirtualShellState(
-            user=self.username or "root",
-            uid=0,
-            gid=0,
-            groups=frozenset([0]),
-            cwd="/root",
-            old_pwd="/",
-            home="/root",
-            shell="/bin/bash",
-            term="xterm-256color",
-        )
-        # The honeypot always presents a root shell; only whoami reflects the
-        # actual login user (per session-isolation report recommendation).
+        self.raw_metadata = dict(raw_metadata or {})
+        # SAFETY: No real file access — the session's FakeFilesystem and shell
+        # state live in the core (shared.session_state), keyed by session_id.
+        # A channel opened later in the same session starts where it left off.
+        self.current_dir = session_cwd(session_id, self.username)
         self.prompt = prompt_for(self.current_dir)
         self._closed = False
         self._editor = LineEditor(
@@ -65,10 +49,11 @@ class FakeSSHShell:
             source_ip=self.source_ip,
             protocol="ssh",
             action=cmd,
-            parameters=parameters if parameters is not None else {"command": cmd},
+            parameters=parameters if parameters is not None else command_parameters(cmd),
             response_status=response_status,
             response_type=response_type,
             mitre=mitre,
+            raw_metadata=self.raw_metadata,
         ))
 
     # ------------------------------------------------------------------
@@ -88,83 +73,78 @@ class FakeSSHShell:
             self._editor.feed(data)
 
     def handle_command(self, cmd: str):
-        # FIX: Rewrite bare "cd" BEFORE decide_response
-        if cmd.strip() == "cd":
-            cmd = "cd /root"
-
         mitre = mitre_analyze(cmd)
-
-        # SAFETY: No subprocess/os.system — all responses via decide_response()
-        # args are passed through untouched so flags and non-path operands
-        # (e.g. `which bash`, `date +%Y`, `find -name ...`) are not corrupted;
-        # relative paths are resolved against cwd inside the engine.
-        args = parse_args(cmd)
-
-        # `;` / `&&` / `||` / `|` / redirection lines go to the shared line path,
-        # which also resolves any `cd` segment and hands back the resulting cwd.
-        chained = has_shell_syntax(cmd)
-        if chained:
-            response, new_cwd = decide_line(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-            )
-            self._apply_cwd(new_cwd)
-        else:
-            response = decide_response(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-                shell_state=self.shell_state,
-            )
+        response = self._decide(cmd)
 
         if response.response_type == "session_end":
             self.channel.send(b"\r\nlogout\r\n")
             self._log(cmd, "0", "session_end", mitre)
-            self._closed = True
+            self._end_channel(0)
             return
-
-        if not chained and cmd.startswith("cd "):
-            if not self._handle_cd(cmd, mitre):
-                return
 
         # Normalize \n to \r\n for PTY display
         content = response.content.replace("\n", "\r\n")
         self.channel.send(("\r\n" + content + "\r\n" + self.prompt).encode())
 
         # A redirected write target is intel: record it, never print it.
-        params = {"command": cmd}
-        if response.redirect:
-            params["redirect"] = response.redirect
+        params = command_parameters(cmd, response.redirect)
         self._log(cmd, response.status, response.response_type, mitre, params)
 
-    def _apply_cwd(self, new_cwd: str) -> None:
-        if new_cwd != self.current_dir:
-            old_cwd = self.current_dir
-            self.current_dir = new_cwd
-            self.prompt = prompt_for(self.current_dir)
-            self.shell_state.cwd = new_cwd
-            self.shell_state.old_pwd = old_cwd
-            self.shell_state.set_env('PWD', new_cwd)
-            self.shell_state.set_env('OLDPWD', old_cwd)
-
-    def _handle_cd(self, cmd: str, mitre: dict) -> bool:
-        """Perform `cd`; returns False when the move failed (already reported)."""
-        result = resolve_cd(cmd[3:].strip(), self.current_dir, self.fs)
-        if result.ok:
-            self._apply_cwd(result.cwd)
-            return True
-
-        self.channel.send(("\r\n" + result.error + "\r\n" + self.prompt).encode())
-        # Log the failed attempt with its target, as before.
-        self._log(
-            cmd, "1", "cd_failed", mitre,
-            {"command": cmd, "target": result.path},
+    def _decide(self, cmd: str):
+        """Answer one command line through the shared decision seam."""
+        # SAFETY: No subprocess/os.system — all responses via decide_response()
+        # args are passed through untouched so flags and non-path operands
+        # (e.g. `which bash`, `date +%Y`, `find -name ...`) are not corrupted;
+        # relative paths are resolved against cwd inside the engine.
+        response = decide_response(
+            "ssh",
+            self.session_id,
+            cmd,
+            {"args": parse_args(cmd), "username": self.username},
         )
-        return False
+        self._set_cwd(response.cwd)
+        return response
+
+    def run_exec(self, command: str) -> int:
+        """Answer an exec request (`ssh host "cmd"`): no prompt, no PTY.
+
+        The command is answered and logged exactly like an interactive one;
+        the channel then reports the exit status and closes, as sshd does.
+        """
+        cmd = command.strip()
+        mitre = mitre_analyze(cmd)
+        response = self._decide(cmd)
+        if response.response_type == "session_end":
+            self._log(cmd, "0", "session_end", mitre)
+            exit_code = 0
+        else:
+            if response.content:
+                # A command's output always ends in a newline.
+                self.channel.sendall(response.content.rstrip("\n").encode() + b"\n")
+            params = command_parameters(cmd, response.redirect)
+            self._log(cmd, response.status, response.response_type, mitre, params)
+            try:
+                exit_code = int(response.status)
+            except (TypeError, ValueError):
+                exit_code = 0
+        self._end_channel(exit_code)
+        return exit_code
+
+    def _end_channel(self, exit_code: int) -> None:
+        """Finish the channel the way sshd does: exit status, then close.
+
+        Closing the transport without this makes the client report
+        "Connection reset by peer" instead of a clean exit.
+        """
+        self._closed = True
+        try:
+            self.channel.send_exit_status(exit_code)
+            self.channel.close()
+        except Exception:  # the client may already be gone
+            pass
+
+    def _set_cwd(self, cwd: str | None) -> None:
+        """Mirror the session's cwd (decided by the engine) into the prompt."""
+        if cwd and cwd != self.current_dir:
+            self.current_dir = cwd
+            self.prompt = prompt_for(self.current_dir)

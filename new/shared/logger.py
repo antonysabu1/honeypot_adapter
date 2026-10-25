@@ -91,7 +91,7 @@ def log_event(event_dict: dict) -> None:
     try:
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event_dict, ensure_ascii=False) + "\n")
-    except (OSError, BrokenError) as exc:
+    except (OSError, BrokenPipeError) as exc:
         # Telemetry failure must never execute attacker code or mutate
         # VirtualOS state; we simply log to stderr and return so the
         # honeypot continues operating without telemetry for this event.

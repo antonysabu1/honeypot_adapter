@@ -7,6 +7,7 @@ top-level keys. ``shared.logger.log_event()`` rejects any event carrying keys
 outside ``CONTRACT_KEYS``.
 """
 
+import shlex
 import uuid
 from datetime import datetime, timezone
 
@@ -46,8 +47,14 @@ def build_event(
     response_status: str,
     response_type: str,
     mitre: dict | None = None,
+    raw_metadata: dict | None = None,
 ) -> dict:
-    """Build one telemetry event carrying exactly the contract's top-level keys."""
+    """Build one telemetry event carrying exactly the contract's top-level keys.
+
+    ``raw_metadata`` is for protocol fingerprint/context data (client banner,
+    terminal type, negotiated options). MITRE tags are merged into the same
+    object under the ``mitre`` key so the top-level schema stays at 11 fields.
+    """
     event = {
         "event_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -56,7 +63,7 @@ def build_event(
         "session_id": session_id,
         "action": action,
         "parameters": parameters,
-        "raw_metadata": {},
+        "raw_metadata": dict(raw_metadata or {}),
         "session_source": "protocol_native",
         "response_status": response_status,
         "response_type": response_type,
@@ -64,6 +71,45 @@ def build_event(
     if mitre:
         event["raw_metadata"]["mitre"] = mitre
     return event
+
+
+def _argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:  # unbalanced quotes: keep what the attacker typed
+        return command.split()
+
+
+def command_parameters(command: str, redirect: str | None = None) -> dict:
+    """Structured ``parameters`` for an attacker command event.
+
+    ``command`` is the line as typed; ``name`` / ``args`` are its (first)
+    command and arguments. A line of several commands (`;`, `&&`, `||`, `|`)
+    also lists each one, in order, under ``segments``. A redirected write
+    target is intel and is recorded under ``redirect``.
+    """
+    # Imported here: the engine's tokenizer is quote-aware, and the engine
+    # does not depend on this module, so there is no cycle at call time.
+    from shared.response_engine import _tokenize
+    from shared.shell_syntax import parse_segment
+
+    commands = []
+    for _connector, segment in _tokenize(command):
+        stages, _red = parse_segment(segment) if segment.strip() else ([], None)
+        for stage in stages:
+            argv = _argv(stage)
+            if argv:
+                commands.append({"name": argv[0], "args": argv[1:]})
+
+    params = {"command": command}
+    if commands:
+        params["name"] = commands[0]["name"]
+        params["args"] = commands[0]["args"]
+    if len(commands) > 1:
+        params["segments"] = commands
+    if redirect:
+        params["redirect"] = redirect
+    return params
 
 
 def mitre_of(event: dict) -> dict:
