@@ -25,6 +25,8 @@ from shared.session import create_session_id, tracker as session_tracker
 
 HOST_KEY_FILE = Path(__file__).resolve().parent / "host_key_asyncssh"
 
+# Sessions one connection may have open at once: sshd's MaxSessions (default 10).
+MAX_SESSIONS = 10
 SERVER_VERSION = "OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"
 
 
@@ -65,6 +67,7 @@ class HoneypotSSHServer(asyncssh.SSHServer):
         self._client_version = None
         self._rejected = False
         self._registered = False
+        self._open_sessions = 0
 
     def _client_metadata(self) -> dict:
         metadata = {}
@@ -190,14 +193,21 @@ class HoneypotSSHServer(asyncssh.SSHServer):
     # ------------------------------------------------------------------
     def session_requested(self) -> tuple:
         """Open a raw-bytes session channel + AsyncSSHShell for each channel."""
+        if self._open_sessions >= MAX_SESSIONS:
+            return False  # sshd: "administratively prohibited"
+        self._open_sessions += 1
         chan = self._conn.create_server_channel(encoding=None)
         shell = AsyncSSHShell(
             session_id=self._session_id,
             source_ip=self._ip,
             username=self._username or "root",
             client_version=self._client_version,
+            on_close=self._session_closed,
         )
         return chan, shell
+
+    def _session_closed(self) -> None:
+        self._open_sessions = max(0, self._open_sessions - 1)
 
 
 async def create_server(host="0.0.0.0", port=2222, **kwargs):
