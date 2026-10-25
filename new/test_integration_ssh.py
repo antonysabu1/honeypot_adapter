@@ -99,6 +99,13 @@ def main() -> None:
         assert b"logout" in out
         chan.settimeout(5)
         assert chan.recv(4096) == b"", "channel did not close after exit"
+        # A clean finish reports exit status 0 (sshd does); a dropped
+        # connection would leave it at -1 and the client sees a reset.
+        assert chan.recv_exit_status() == 0, "exit did not report exit status 0"
+        client.get_transport().join(timeout=5)
+        assert not client.get_transport().is_active(), (
+            "server left the connection open after exit"
+        )
 
         # --- 8) events flowed through the shared logging pipeline ---
         events = [
