@@ -3,8 +3,7 @@
 This is the transport-specific half of the honeypot. All command processing
 is delegated unchanged to the honeypot core:
 
-    shared.response_engine.decide_response
-    shared.filesystem.FakeFilesystem
+    shared.response_engine.decide_response   (the single decision seam)
     shared.mitre.mitre_analyze
     shared.logger.log_event
 
@@ -19,15 +18,9 @@ transports are interchangeable.
 import asyncssh
 
 from shared.events import build_event
-from shared.filesystem import FakeFilesystem
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
-from shared.response_engine import (
-    decide_line,
-    decide_response,
-    has_shell_syntax,
-)
-from shared.shell_state import VirtualShellState
+from shared.response_engine import decide_response
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
@@ -40,8 +33,8 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
     """One interactive shell or exec invocation on an SSH transport.
 
     A fresh instance is created per session channel
-    (session_requested() -> AsyncSSHShell) and is fully discarded on close,
-    so state never leaks between clients.
+    (session_requested() -> AsyncSSHShell). The VirtualOS state behind it is
+    the core's, keyed by session_id, so it never leaks between clients.
     """
 
     def __init__(self, session_id: str, source_ip: str, username: str = "root",
@@ -51,19 +44,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         self.username = username or "root"
         self.client_version = client_version
         self.term_type = None
-        self.fs = FakeFilesystem()
         self.current_dir = "/root"
-        self.shell_state = VirtualShellState(
-            user=self.username,
-            uid=0,
-            gid=0,
-            groups=frozenset([0]),
-            cwd="/root",
-            old_pwd="/",
-            home="/root",
-            shell="/bin/bash",
-            term="xterm-256color",
-        )
         self.prompt = prompt_for(self.current_dir)
         self._chan = None
         self._exec_command = None
@@ -117,32 +98,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
     def handle_command(self, cmd: str) -> None:
         mitre = mitre_analyze(cmd)
 
-        args = parse_args(cmd)
-
-        # `;` / `&&` / `||` / `|` / redirection lines go to the shared line path,
-        # which also resolves any `cd` segment and hands back the resulting cwd.
-        chained = has_shell_syntax(cmd)
-        if chained:
-            response, new_cwd = decide_line(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-            )
-            self._apply_cwd(new_cwd)
-        else:
-            response = decide_response(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-                shell_state=self.shell_state,
-            )
-            self._sync_cwd()
+        response = self._decide(cmd)
 
         if response.response_type == "session_end":
             self._write(b"\r\nlogout\r\n")
@@ -167,20 +123,21 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
             mitre=mitre, raw_metadata=self._raw_metadata(),
         ))
 
-    def _apply_cwd(self, new_cwd: str) -> None:
-        if new_cwd != self.current_dir:
-            old_cwd = self.current_dir
-            self.current_dir = new_cwd
-            self.prompt = prompt_for(self.current_dir)
-            self.shell_state.cwd = new_cwd
-            self.shell_state.old_pwd = old_cwd
-            self.shell_state.set_env("PWD", new_cwd)
-            self.shell_state.set_env("OLDPWD", old_cwd)
+    def _decide(self, cmd: str):
+        """Answer one command line through the shared decision seam."""
+        response = decide_response(
+            "ssh",
+            self.session_id,
+            cmd,
+            {"args": parse_args(cmd), "username": self.username},
+        )
+        self._set_cwd(response.cwd)
+        return response
 
-    def _sync_cwd(self) -> None:
-        """Mirror a cwd change made by decide_response() into the prompt."""
-        if self.shell_state.cwd != self.current_dir:
-            self.current_dir = self.shell_state.cwd
+    def _set_cwd(self, cwd: str | None) -> None:
+        """Mirror the session's cwd (decided by the engine) into the prompt."""
+        if cwd and cwd != self.current_dir:
+            self.current_dir = cwd
             self.prompt = prompt_for(self.current_dir)
 
     def _raw_metadata(self) -> dict:
@@ -198,28 +155,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         cmd = command.strip()
         mitre = mitre_analyze(cmd)
 
-        args = parse_args(cmd)
-        if has_shell_syntax(cmd):
-            response, new_cwd = decide_line(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-            )
-            self._apply_cwd(new_cwd)
-        else:
-            response = decide_response(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-                shell_state=self.shell_state,
-            )
-            self._sync_cwd()
+        response = self._decide(cmd)
 
         if response.response_type == "session_end":
             response = None  # `exit` as an exec: no output, exit 0

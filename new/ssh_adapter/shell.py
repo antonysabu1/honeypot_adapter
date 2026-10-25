@@ -1,13 +1,7 @@
 from shared.events import build_event
-from shared.filesystem import FakeFilesystem
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
-from shared.response_engine import (
-    decide_line,
-    decide_response,
-    has_shell_syntax,
-)
-from shared.shell_state import VirtualShellState
+from shared.response_engine import decide_response
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
@@ -31,22 +25,9 @@ class FakeSSHShell:
         self.source_ip = source_ip
         self.username = username or "root"
         self.raw_metadata = dict(raw_metadata or {})
-        # SAFETY: No real file access — uses FakeFilesystem
-        self.fs = FakeFilesystem()
+        # SAFETY: No real file access — the session's FakeFilesystem and shell
+        # state live in the core (shared.session_state), keyed by session_id.
         self.current_dir = "/root"
-        self.shell_state = VirtualShellState(
-            user=self.username or "root",
-            uid=0,
-            gid=0,
-            groups=frozenset([0]),
-            cwd="/root",
-            old_pwd="/",
-            home="/root",
-            shell="/bin/bash",
-            term="xterm-256color",
-        )
-        # The honeypot always presents a root shell; only whoami reflects the
-        # actual login user (per session-isolation report recommendation).
         self.prompt = prompt_for(self.current_dir)
         self._closed = False
         self._editor = LineEditor(
@@ -110,39 +91,18 @@ class FakeSSHShell:
         self._log(cmd, response.status, response.response_type, mitre, params)
 
     def _decide(self, cmd: str):
-        """Answer one command line through the shared engine."""
+        """Answer one command line through the shared decision seam."""
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         # args are passed through untouched so flags and non-path operands
         # (e.g. `which bash`, `date +%Y`, `find -name ...`) are not corrupted;
         # relative paths are resolved against cwd inside the engine.
-        args = parse_args(cmd)
-
-        # `;` / `&&` / `||` / `|` / redirection lines go to the shared line path,
-        # which also resolves any `cd` segment and hands back the resulting cwd.
-        chained = has_shell_syntax(cmd)
-        if chained:
-            response, new_cwd = decide_line(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-            )
-            self._apply_cwd(new_cwd)
-        else:
-            response = decide_response(
-                "ssh",
-                self.session_id,
-                cmd,
-                {"args": args, "cwd": self.current_dir},
-                self.fs,
-                username=self.username,
-                shell_state=self.shell_state,
-            )
-            # `cd` mutates the session's shell state inside the one decision
-            # seam; the transport only mirrors the resulting cwd into its prompt.
-            self._sync_cwd()
+        response = decide_response(
+            "ssh",
+            self.session_id,
+            cmd,
+            {"args": parse_args(cmd), "username": self.username},
+        )
+        self._set_cwd(response.cwd)
         return response
 
     def run_exec(self, command: str) -> int:
@@ -173,18 +133,8 @@ class FakeSSHShell:
         self.channel.close()
         return exit_code
 
-    def _apply_cwd(self, new_cwd: str) -> None:
-        if new_cwd != self.current_dir:
-            old_cwd = self.current_dir
-            self.current_dir = new_cwd
-            self.prompt = prompt_for(self.current_dir)
-            self.shell_state.cwd = new_cwd
-            self.shell_state.old_pwd = old_cwd
-            self.shell_state.set_env('PWD', new_cwd)
-            self.shell_state.set_env('OLDPWD', old_cwd)
-
-    def _sync_cwd(self) -> None:
-        """Mirror a cwd change made by decide_response() into the prompt."""
-        if self.shell_state.cwd != self.current_dir:
-            self.current_dir = self.shell_state.cwd
+    def _set_cwd(self, cwd: str | None) -> None:
+        """Mirror the session's cwd (decided by the engine) into the prompt."""
+        if cwd and cwd != self.current_dir:
+            self.current_dir = cwd
             self.prompt = prompt_for(self.current_dir)

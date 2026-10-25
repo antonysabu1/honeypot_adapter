@@ -21,6 +21,7 @@ from shared.permissions import (
     identity_for,
     traverse,
 )
+from shared.session_state import get_state
 from shared.shell_state import VirtualShellState
 from shared.shell import resolve_cd
 from shared.shell_syntax import (
@@ -40,6 +41,9 @@ class ResponsePlan:
     # Where the line's output was routed, when it was redirected. Recorded as
     # intel by the transports instead of being shown to the attacker.
     redirect: str | None = None
+    # The session's working directory once the command has run. Transports
+    # render their prompt from it instead of tracking shell state themselves.
+    cwd: str | None = None
 
 def _fake_date() -> str:
     """GNU `date`-style output (UTC, like a server misconfigured for realism)."""
@@ -1473,16 +1477,53 @@ def decide_response(
     session_id: str,
     action: str,
     parameters: dict,
-    fs: FakeFilesystem,
-    username: str = "root",
+    fs: FakeFilesystem | None = None,
+    username: str | None = None,
     shell_state: "VirtualShellState | None" = None,
 ) -> ResponsePlan:
-    """Answer ONE command; `protocol`/`session_id` are accepted for callers.
+    """The decision seam: answer one attacker command line for a session.
+
+    Every transport decides what to send back through this one call, for a
+    plain command and for a `;` / `&&` / `||` / `|` / redirection line alike.
+    The session's VirtualOS state (filesystem, shell) is owned by the core and
+    looked up by `session_id`; the login user comes from
+    `parameters["username"]`. The returned plan carries the resulting cwd for
+    the prompt. When the Control Engine exists it replaces the internals of
+    this function, and no caller changes.
+
+    `fs` / `shell_state` are only for tests and tools that drive a standalone
+    VirtualOS instead of a session's.
+    """
+    username = username or parameters.get("username") or "root"
+    if fs is None:
+        state = get_state(session_id, username)
+        fs = state.fs
+        if shell_state is None:
+            shell_state = state.shell
+    if has_shell_syntax(action):
+        plan, cwd = decide_line(protocol, session_id, action, parameters, fs,
+                                username=username, shell_state=shell_state)
+    else:
+        plan = _decide_command(protocol, session_id, action.strip(), parameters,
+                               fs, username, shell_state)
+        cwd = shell_state.cwd if shell_state is not None else parameters.get("cwd", "/")
+    plan.cwd = cwd
+    return plan
+
+def _decide_command(
+    protocol: str,
+    session_id: str,
+    cmd: str,
+    parameters: dict,
+    fs: FakeFilesystem,
+    username: str,
+    shell_state: "VirtualShellState | None",
+) -> ResponsePlan:
+    """Answer ONE command (no sequencing, pipes or redirection).
 
     Every command lives in its own small handler in _ROUTES, tried in order, so
     a single command can be read and changed without scanning the rest.
     """
-    cmd = action.strip()
     if shell_state is None:
         shell_state = VirtualShellState(
             user=username,
@@ -1499,7 +1540,7 @@ def decide_response(
         cmd=cmd,
         base=cmd.split()[0] if cmd else '',
         args=parameters.get('args', []),
-        cwd=parameters.get('cwd', '/'),
+        cwd=parameters.get('cwd', shell_state.cwd),
         fs=fs,
         username=username,
         identity=identity_for(fs, username),
@@ -1629,16 +1670,18 @@ def _run_pipeline(
     protocol: str,
     session_id: str,
     username: str,
+    shell_state: "VirtualShellState | None" = None,
 ) -> tuple[ResponsePlan, str]:
     """Run one pipeline stage by stage, feeding stdout into the next stage."""
     first = stages[0]
-    plan = decide_response(
+    plan = _decide_command(
         protocol,
         session_id,
         first,
         {"args": first.split()[1:], "cwd": cwd},
         fs,
-        username=username,
+        username,
+        shell_state,
     )
     text, status = plan.content, plan.status
 
@@ -1710,6 +1753,7 @@ def _run_segment(
     session_id: str,
     username: str,
     ident=None,
+    shell_state: "VirtualShellState | None" = None,
 ) -> tuple[ResponsePlan, str]:
     """Run one `;`-separated segment: its pipeline, redirections and `cd`."""
     stages, red = parse_segment(segment)
@@ -1737,8 +1781,15 @@ def _run_segment(
             return ResponsePlan("command_output", "", "0"), result.cwd
         return ResponsePlan("cd_failed", result.error, "1"), cwd
 
-    plan, new_cwd = _run_pipeline(stages, cwd, fs, protocol, session_id, username)
+    plan, new_cwd = _run_pipeline(stages, cwd, fs, protocol, session_id, username,
+                                  shell_state)
     return _apply_redirections(plan, red, cwd, fs, ident), new_cwd
+
+def _move_cwd(shell_state: VirtualShellState, old_cwd: str, new_cwd: str) -> None:
+    shell_state.cwd = new_cwd
+    shell_state.old_pwd = old_cwd
+    shell_state.set_env('PWD', new_cwd)
+    shell_state.set_env('OLDPWD', old_cwd)
 
 def decide_line(
     protocol: str,
@@ -1747,19 +1798,22 @@ def decide_line(
     parameters: dict,
     fs: FakeFilesystem,
     username: str = "root",
+    shell_state: "VirtualShellState | None" = None,
 ) -> tuple[ResponsePlan, str]:
     """Answer a full command line; returns (plan, resulting cwd).
 
-    `;` always continues, `&&` continues only after a zero status, `||` only
+    Reached through decide_response(); called directly only by tests. `;`
+    always continues, `&&` continues only after a zero status, `||` only
     after a non-zero one. The exit status is that of the last segment actually
     executed, and output is the concatenation of every segment that ran.
+    A session's shell state follows every `cd` and `export` along the line.
     """
-    cwd = parameters.get("cwd", "/")
+    cwd = parameters.get("cwd", shell_state.cwd if shell_state is not None else "/")
     if not has_shell_syntax(action):
         # One plain command: unchanged single-command behaviour.
-        return decide_response(
-            protocol, session_id, action, parameters, fs, username=username
-        ), cwd
+        plan = _decide_command(protocol, session_id, action.strip(), parameters,
+                               fs, username, shell_state)
+        return plan, shell_state.cwd if shell_state is not None else cwd
 
     tokens = _tokenize(action)
     ident = identity_for(fs, username)
@@ -1773,7 +1827,11 @@ def decide_line(
         if connector == "||" and status == "0":
             continue
 
-        plan, cwd = _run_segment(segment, cwd, fs, protocol, session_id, username, ident)
+        plan, new_cwd = _run_segment(segment, cwd, fs, protocol, session_id,
+                                     username, ident, shell_state)
+        if shell_state is not None and new_cwd != cwd:
+            _move_cwd(shell_state, cwd, new_cwd)
+        cwd = new_cwd
         status = plan.status
         if plan.response_type == "session_end":
             return ResponsePlan("session_end", plan.content, plan.status), cwd

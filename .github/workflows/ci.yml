@@ -32,6 +32,7 @@ jobs:
             test_session.py \
             test_response_engine.py \
             test_chaining.py \
+            test_seam.py \
             test_shell_syntax.py \
             test_recon.py \
             test_acceptance.py \

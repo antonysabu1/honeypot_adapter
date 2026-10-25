@@ -1,13 +1,7 @@
 from shared.events import build_event
-from shared.filesystem import FakeFilesystem
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
-from shared.response_engine import (
-    decide_line,
-    decide_response,
-    has_shell_syntax,
-)
-from shared.shell_state import VirtualShellState
+from shared.response_engine import decide_response
 from shared.shell import (
     POST_LOGIN_BANNER,
     parse_args,
@@ -21,23 +15,12 @@ class TelnetSession:
         self.transport = transport
         self.session_id = session_id
         self.source_ip = source_ip
-        # SAFETY: No real file access — uses FakeFilesystem
-        self.fs = FakeFilesystem()
+        # SAFETY: No real file access — the session's FakeFilesystem and shell
+        # state live in the core (shared.session_state), keyed by session_id.
         self.state = "login"
         self.username = ""
         self.password = ""
         self.current_dir = "/root"
-        self.shell_state = VirtualShellState(
-            user=self.username or "root",
-            uid=0,
-            gid=0,
-            groups=frozenset([0]),
-            cwd="/root",
-            old_pwd="/",
-            home="/root",
-            shell="/bin/bash",
-            term="xterm-256color",
-        )
         self.prompt = prompt_for(self.current_dir)
         self.buffer = b""
         self._iac_buf = b""  # leftover bytes of a partial IAC sequence
@@ -225,57 +208,28 @@ class TelnetSession:
             if not line:
                 self.transport.write(("\r\n" + self.prompt).encode())
                 return
-            # Relative file paths are resolved against cwd inside decide_response()
-            # via _resolve_path; args are passed through untouched so flags and
-            # non-path operands (e.g. `which bash`, `date +%Y`, `find -name ...`)
-            # are not corrupted by cwd-joining.
-            args = parse_args(line)
-
             mitre = mitre_analyze(line)
 
-            # SAFETY: No subprocess/os.system — all responses via decide_response()
-            # `;` / `&&` / `||` / `|` / redirection lines go to the shared line
-            # path, which also resolves any `cd` segment and hands back the cwd.
-            chained = has_shell_syntax(line)
-            if chained:
-                response, new_cwd = decide_line(
-                    "telnet",
-                    self.session_id,
-                    line,
-                    {"args": args, "cwd": self.current_dir},
-                    self.fs,
-                    username=self.username or "root",
-                )
-                if new_cwd != self.current_dir:
-                    old_cwd = self.current_dir
-                    self.current_dir = new_cwd
-                    self.prompt = prompt_for(self.current_dir)
-                    self.shell_state.cwd = new_cwd
-                    self.shell_state.old_pwd = old_cwd
-                    self.shell_state.set_env("PWD", new_cwd)
-                    self.shell_state.set_env("OLDPWD", old_cwd)
-            else:
-                response = decide_response(
-                    "telnet",
-                    self.session_id,
-                    line,
-                    {"args": args, "cwd": self.current_dir},
-                    self.fs,
-                    username=self.username or "root",
-                    shell_state=self.shell_state,
-                )
+            # SAFETY: No subprocess/os.system — all responses via decide_response(),
+            # the one decision seam for plain and `;` / `|` / redirection lines.
+            # Relative file paths are resolved against cwd inside the engine;
+            # args are passed through untouched so flags and non-path operands
+            # (e.g. `which bash`, `date +%Y`, `find -name ...`) are not corrupted.
+            response = decide_response(
+                "telnet",
+                self.session_id,
+                line,
+                {"args": parse_args(line), "username": self.username or "root"},
+            )
+            if response.cwd and response.cwd != self.current_dir:
+                self.current_dir = response.cwd
+                self.prompt = prompt_for(self.current_dir)
 
             if response.response_type == "session_end":
                 self.transport.write(b"\r\nlogout\r\n")
                 self._log(line, "0", "session_end", mitre)
                 self.transport.close()
                 return
-
-            # `cd` mutates the session's shell state inside the one decision
-            # seam; the transport only mirrors the resulting cwd into its prompt.
-            if not chained and self.shell_state.cwd != self.current_dir:
-                self.current_dir = self.shell_state.cwd
-                self.prompt = prompt_for(self.current_dir)
 
             content = response.content.replace("\n", "\r\n")
             self.transport.write(("\r\n" + content + "\r\n" + self.prompt).encode())

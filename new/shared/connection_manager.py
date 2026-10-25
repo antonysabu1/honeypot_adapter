@@ -66,6 +66,11 @@ def _increment_session_command_count(session_id: str) -> None:
     _session_command_counts[session_id] = _session_command_counts.get(session_id, 0) + 1
 
 
+def forget_session_commands(session_id: str) -> None:
+    """Drop a finished session's command counter."""
+    _session_command_counts.pop(session_id, None)
+
+
 def _check_session_command_limit(session_id: str) -> bool:
     """Return True if the session has not yet reached max_commands_per_session."""
     from shared.config import get
