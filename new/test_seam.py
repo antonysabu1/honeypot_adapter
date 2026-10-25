@@ -66,6 +66,31 @@ def test_sessions_are_isolated_and_released() -> None:
     tracker.end_session(b)
 
 
+def test_environment_is_per_session() -> None:
+    a = tracker.start_session("10.0.0.5", "ssh")
+    b = tracker.start_session("10.0.0.6", "ssh")
+    # A login shell starts with the standard environment.
+    env = ask(a, "env", username="alice").content
+    for expected in ("HOME=/root", "USER=alice", "SHELL=/bin/bash", "PWD=/root"):
+        assert expected in env.splitlines(), (expected, env)
+    # What the attacker exports is visible to printenv/env, in that session only.
+    ask(a, "export TOKEN=abc DEBUG=1")
+    assert ask(a, "printenv TOKEN").content == "abc\n"
+    assert ask(a, "printenv TOKEN DEBUG").content == "abc\n1\n"
+    assert "TOKEN=abc" in ask(a, "env").content
+    assert ask(b, "printenv TOKEN").status == "1", "variable leaked between sessions"
+    # A missing name makes printenv fail, and unset removes a variable.
+    assert ask(a, "printenv NOPE").status == "1"
+    ask(a, "unset TOKEN")
+    assert ask(a, "printenv TOKEN").status == "1"
+    # cd keeps PWD/OLDPWD in the environment.
+    ask(a, "cd /tmp")
+    assert ask(a, "printenv PWD").content == "/tmp\n"
+    assert ask(a, "printenv OLDPWD").content == "/root\n"
+    tracker.end_session(a)
+    tracker.end_session(b)
+
+
 def test_transports_use_only_the_seam() -> None:
     for rel in TRANSPORTS:
         tree = ast.parse((PROJECT_ROOT / rel).read_text(encoding="utf-8"))
@@ -95,6 +120,7 @@ def main() -> None:
     test_state_persists_per_session()
     test_lines_go_through_the_same_seam()
     test_sessions_are_isolated_and_released()
+    test_environment_is_per_session()
     test_transports_use_only_the_seam()
     print("ALL SEAM TESTS PASSED")
 
