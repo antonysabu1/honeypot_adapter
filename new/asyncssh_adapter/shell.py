@@ -165,7 +165,8 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
             response = None  # `exit` as an exec: no output, exit 0
 
         if response is not None and response.content:
-            self._write(response.content.encode())
+            # A command's output always ends in a newline.
+            self._write(response.content.rstrip("\n").encode() + b"\n")
 
         # A redirected write target is intel: record it, never print it.
         params = command_parameters(cmd, response.redirect if response else None)
