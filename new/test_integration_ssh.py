@@ -167,6 +167,47 @@ def main() -> None:
             finally:
                 exec_client.close()
 
+        # --- 10) several channels on ONE connection share the session ---
+        multi = paramiko.SSHClient()
+        multi.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            multi.connect(
+                "127.0.0.1", port=port, username="mux", password="mux",
+                look_for_keys=False, allow_agent=False, timeout=10,
+            )
+
+            def run(cmd):
+                _, stdout, stderr = multi.exec_command(cmd, timeout=10)
+                return (stdout.read() + stderr.read()).decode(), stdout.channel.recv_exit_status()
+
+            out, rc = run("cd /etc")
+            assert rc == 0, (out, rc)
+            out, rc = run("pwd")  # a later channel sees the earlier one's cd
+            assert out.strip() == "/etc" and rc == 0, (out, rc)
+            run("export MUX_VAR=7")
+            out, _ = run("printenv MUX_VAR")
+            assert out.strip() == "7", out
+            # An interactive shell on the same connection starts in /etc.
+            shell = multi.invoke_shell()
+            out = recv_until(shell, b"# ")
+            assert b"root@honeypot:/etc# " in out, f"new channel prompt: {out!r}"
+            shell.send(b"exit\r")
+            recv_until(shell, b"logout")
+            # A different connection is a different session.
+            other = paramiko.SSHClient()
+            other.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            other.connect(
+                "127.0.0.1", port=port, username="other", password="other",
+                look_for_keys=False, allow_agent=False, timeout=10,
+            )
+            try:
+                _, stdout, _ = other.exec_command("pwd", timeout=10)
+                assert stdout.read().decode().strip() == "/root", "state leaked"
+            finally:
+                other.close()
+        finally:
+            multi.close()
+
         events = [
             json.loads(line)
             for line in logger_mod.LOG_FILE.read_text(encoding="utf-8").splitlines()
