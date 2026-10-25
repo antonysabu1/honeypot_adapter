@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Optional
 
 
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
 @dataclass
 class VirtualShellState:
     """Virtual shell state for a logged-in session.
@@ -72,6 +75,18 @@ class VirtualShellState:
         # Ensure gid is in groups
         if self.gid not in self.groups:
             self.groups = frozenset([self.gid] | set(self.groups))
+        # A login shell starts with the standard environment; anything the
+        # caller passed in wins.
+        for name, value in (
+            ("HOME", self.home),
+            ("USER", self.user),
+            ("SHELL", self.shell),
+            ("PATH", DEFAULT_PATH),
+            ("LANG", "en_US.UTF-8"),
+            ("TERM", self.term),
+            ("PWD", self.cwd),
+        ):
+            self.env.setdefault(name, value)
 
     def copy(self) -> "VirtualShellState":
         """Return a shallow copy of this state."""
