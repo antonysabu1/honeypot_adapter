@@ -57,6 +57,11 @@ def get_state(session_id: str, username: str = "root") -> SessionState:
         return state
 
 
+def session_cwd(session_id: str, username: str = "root") -> str:
+    """The session's current directory (a new channel starts where it is)."""
+    return get_state(session_id, username).shell.cwd
+
+
 def drop_state(session_id: str) -> None:
     """Forget a finished session's state."""
     with _LOCK:

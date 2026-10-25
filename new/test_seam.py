@@ -99,9 +99,14 @@ def test_transports_use_only_the_seam() -> None:
             if isinstance(node, ast.ImportFrom) and node.module == "shared.response_engine":
                 engine_names |= {alias.name for alias in node.names}
             if isinstance(node, ast.ImportFrom) and node.module in (
-                "shared.filesystem", "shared.shell_state", "shared.session_state",
+                "shared.filesystem", "shared.shell_state",
             ):
                 raise AssertionError(f"{rel} holds VirtualOS state ({node.module})")
+            if isinstance(node, ast.ImportFrom) and node.module == "shared.session_state":
+                # The one read-only exception: a new channel asks where the
+                # session currently is, to draw its first prompt.
+                extra = {alias.name for alias in node.names} - {"session_cwd"}
+                assert not extra, f"{rel} reaches into session state: {sorted(extra)}"
         assert engine_names == {"decide_response"}, (
             f"{rel} imports {sorted(engine_names)} from the engine; only decide_response is the seam"
         )
