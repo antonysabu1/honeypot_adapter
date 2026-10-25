@@ -1347,14 +1347,14 @@ def _cmd_env(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_printenv(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'printenv':
+        env = ctx.shell_state.env
         if not ctx.args:
-            lines = [f"{k}={v}" for k, v in sorted(_ENV.items())]
+            lines = [f"{k}={v}" for k, v in sorted(env.items())]
             return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
-        key = ctx.args[0]
-        val = _ENV.get(key)
-        if val is None:
-            return ResponsePlan('command_output', '', '1')
-        return ResponsePlan('command_output', val + '\n', '0')
+        # Named variables print their values; any missing one makes status 1.
+        values = [env[k] for k in ctx.args if k in env]
+        status = '0' if len(values) == len(ctx.args) else '1'
+        return ResponsePlan('command_output', ''.join(v + '\n' for v in values), status)
     return None
 
 
