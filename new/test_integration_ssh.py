@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import paramiko
 
 import shared.logger as logger_mod
+import ssh_adapter.server as ssh_server
 from ssh_adapter.server import SSHHandler
 
 
@@ -214,6 +215,37 @@ def main() -> None:
                 other.close()
         finally:
             multi.close()
+
+        # --- 11) like sshd: the connection outlives its sessions, and a session
+        # can be opened again later; the 11th simultaneous one is refused ---
+        live = paramiko.SSHClient()
+        live.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            live.connect(
+                "127.0.0.1", port=port, username="idle", password="idle",
+                look_for_keys=False, allow_agent=False, timeout=10,
+            )
+            transport = live.get_transport()
+            time.sleep(2.5)  # authenticated, no session yet: still up
+            assert transport.is_active(), "connection dropped with no session open"
+            _, stdout, _ = live.exec_command("pwd", timeout=10)
+            stdout.read()
+            time.sleep(2.5)  # the only session has ended: still up
+            assert transport.is_active(), "connection dropped after its last session"
+            _, stdout, _ = live.exec_command("pwd", timeout=10)
+            assert stdout.read().strip() == b"/root", "later session not served"
+
+            held = [transport.open_session() for _ in range(ssh_server.MAX_CHANNELS)]
+            try:
+                transport.open_session()
+            except paramiko.ChannelException as exc:
+                assert exc.code == paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED, exc
+            else:
+                raise AssertionError("11th simultaneous session was accepted")
+            for chan_ in held:
+                chan_.close()
+        finally:
+            live.close()
 
         events = [
             json.loads(line)
