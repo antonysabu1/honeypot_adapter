@@ -1340,7 +1340,7 @@ _ENV: dict[str, str] = {
 
 def _cmd_env(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'env':
-        lines = [f"{k}={v}" for k, v in sorted(_ENV.items())]
+        lines = [f"{k}={v}" for k, v in sorted(ctx.shell_state.env.items())]
         return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
     return None
 
