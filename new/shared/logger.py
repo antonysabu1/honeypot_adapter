@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 
-from shared.events import CONTRACT_KEYS
+from shared.events import CONTRACT_KEYS, mitre_of
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -106,7 +106,39 @@ def log_event(event_dict: dict) -> None:
         # keep the running honeypot functional.
         print("telemetry prune failure", flush=True)
 
+    # Dual write: also persist to SQLite. Best-effort \u2014 never raises.
+    try:
+        _write_to_storage(event_dict)
+    except Exception:
+        pass
+
     print(
         f"[{str(event_dict['protocol']).upper()}] "
         f"{event_dict['source_ip']} \u2192 action: {event_dict['action']}"
+    )
+
+
+def _write_to_storage(event_dict: dict) -> None:
+    """Write one event to the SQLite store (best-effort, called from log_event)."""
+    import shared.storage as storage_mod
+    # Redirect DB to the same directory as LOG_FILE so tests stay isolated.
+    db_path = Path(LOG_FILE).parent / "honeypot.db"
+    if storage_mod.DB_FILE != db_path:
+        storage_mod.DB_FILE = db_path
+        storage_mod.close_storage()
+    store = storage_mod.get_storage()
+
+    mitre = mitre_of(event_dict)
+    store.insert_event(
+        event_id=event_dict.get("event_id"),
+        session_id=event_dict.get("session_id"),
+        protocol=event_dict.get("protocol", ""),
+        action=event_dict.get("action", ""),
+        parameters=event_dict.get("parameters"),
+        response_type=event_dict.get("response_type", ""),
+        status=str(event_dict.get("response_status", "0")),
+        mitre_attack_id=mitre.get("mitre_attack_id"),
+        mitre_technique_name=mitre.get("mitre_technique_name"),
+        mitre_tactic=mitre.get("mitre_tactic"),
+        mitre_technique_name_secondary=mitre.get("mitre_technique_name_secondary"),
     )

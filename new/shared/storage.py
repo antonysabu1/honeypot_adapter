@@ -280,6 +280,14 @@ class StorageEngine:
     ) -> str:
         eid = event_id or _uuid()
         ts = _now_iso()
+        # Auto-create a minimal session stub so FK constraints never block an event.
+        if session_id:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO sessions
+                   (session_id, source_ip, protocol, started_at, last_seen, request_count)
+                   VALUES (?, '', ?, ?, ?, 0)""",
+                (session_id, protocol, ts, ts),
+            )
         self._conn.execute(
             """INSERT OR IGNORE INTO events
                (event_id, timestamp, session_id, protocol, action,
