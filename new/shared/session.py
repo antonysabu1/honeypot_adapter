@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -12,6 +13,7 @@ def create_session_id() -> str:
 class SessionTracker:
     def __init__(self) -> None:
         self._sessions = {}
+        self._start_times: dict[str, float] = {}
 
     def start_session(self, source_ip: str, protocol: str, session_id: str | None = None) -> str:
         if session_id is None:
@@ -22,11 +24,25 @@ class SessionTracker:
             "start_time": datetime.now(timezone.utc).isoformat(),
             "session_source": "protocol_native",
         }
+        self._start_times[session_id] = time.monotonic()
+        try:
+            from shared.storage import get_storage
+            get_storage().upsert_session(session_id, source_ip, protocol)
+        except Exception:
+            pass
         return session_id
 
     def end_session(self, session_id: str) -> None:
+        duration_ms: int | None = None
+        if session_id in self._start_times:
+            duration_ms = int((time.monotonic() - self._start_times.pop(session_id)) * 1000)
         if session_id in self._sessions:
             del self._sessions[session_id]
+        try:
+            from shared.storage import get_storage
+            get_storage().close_session(session_id, duration_ms)
+        except Exception:
+            pass
         # The core owns per-session VirtualOS state; release it with the session.
         drop_state(session_id)
         forget_session_commands(session_id)
