@@ -77,7 +77,7 @@ class FakeSSHShell:
         if response.response_type == "session_end":
             self.channel.send(b"\r\nlogout\r\n")
             self._log(cmd, "0", "session_end", mitre)
-            self._closed = True
+            self._end_channel(0)
             return
 
         # Normalize \n to \r\n for PTY display
@@ -124,10 +124,21 @@ class FakeSSHShell:
                 exit_code = int(response.status)
             except (TypeError, ValueError):
                 exit_code = 0
-        self.channel.send_exit_status(exit_code)
-        self._closed = True
-        self.channel.close()
+        self._end_channel(exit_code)
         return exit_code
+
+    def _end_channel(self, exit_code: int) -> None:
+        """Finish the channel the way sshd does: exit status, then close.
+
+        Closing the transport without this makes the client report
+        "Connection reset by peer" instead of a clean exit.
+        """
+        self._closed = True
+        try:
+            self.channel.send_exit_status(exit_code)
+            self.channel.close()
+        except Exception:  # the client may already be gone
+            pass
 
     def _set_cwd(self, cwd: str | None) -> None:
         """Mirror the session's cwd (decided by the engine) into the prompt."""
