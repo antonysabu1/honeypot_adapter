@@ -408,11 +408,14 @@ def main():
     total_passed = 0
     total_failed = 0
     for name, fn in tests:
-        result = fn()
-        if result:
-            total_passed += 1
-        else:
+        # Each test asserts; one that raises has failed, one that returns passed.
+        try:
+            fn()
+        except AssertionError as exc:
+            print(f"  FAIL {name}: {exc}")
             total_failed += 1
+        else:
+            total_passed += 1
         print()
 
     print(f"M16 Telemetry Test Summary: {total_passed} passed, {total_failed} failed")
