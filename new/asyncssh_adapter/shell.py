@@ -27,12 +27,12 @@ from shared.response_engine import (
     decide_response,
     has_shell_syntax,
 )
+from shared.shell_state import VirtualShellState
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
     parse_args,
     prompt_for,
-    resolve_cd,
 )
 
 
@@ -44,12 +44,26 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
     so state never leaks between clients.
     """
 
-    def __init__(self, session_id: str, source_ip: str, username: str = "root"):
+    def __init__(self, session_id: str, source_ip: str, username: str = "root",
+                 client_version: str | None = None):
         self.session_id = session_id
         self.source_ip = source_ip
         self.username = username or "root"
+        self.client_version = client_version
+        self.term_type = None
         self.fs = FakeFilesystem()
         self.current_dir = "/root"
+        self.shell_state = VirtualShellState(
+            user=self.username,
+            uid=0,
+            gid=0,
+            groups=frozenset([0]),
+            cwd="/root",
+            old_pwd="/",
+            home="/root",
+            shell="/bin/bash",
+            term="xterm-256color",
+        )
         self.prompt = prompt_for(self.current_dir)
         self._chan = None
         self._exec_command = None
@@ -68,6 +82,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         self._chan = chan
 
     def pty_requested(self, term_type, term_size, term_modes) -> bool:
+        self.term_type = term_type
         return True
 
     def shell_requested(self) -> bool:
@@ -100,9 +115,6 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
     # Command handling (shared with ssh_adapter/shell.py via shared.shell)
     # ------------------------------------------------------------------
     def handle_command(self, cmd: str) -> None:
-        if cmd.strip() == "cd":  # rewrite bare cd before decide_response
-            cmd = "cd /root"
-
         mitre = mitre_analyze(cmd)
 
         args = parse_args(cmd)
@@ -128,21 +140,19 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
                 {"args": args, "cwd": self.current_dir},
                 self.fs,
                 username=self.username,
+                shell_state=self.shell_state,
             )
+            self._sync_cwd()
 
         if response.response_type == "session_end":
             self._write(b"\r\nlogout\r\n")
             log_event(build_event(
                 self.session_id, self.source_ip, "ssh", cmd,
                 {"command": cmd}, "0", "session_end", mitre=mitre,
+                raw_metadata=self._raw_metadata(),
             ))
             self._exit_session(0)
             return
-
-        if not chained and cmd.startswith("cd "):
-            handled = self._handle_cd(cmd, mitre)
-            if handled is not None:
-                return
 
         content = response.content.replace("\n", "\r\n")
         self._write(("\r\n" + content + "\r\n" + self.prompt).encode())
@@ -154,27 +164,32 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         log_event(build_event(
             self.session_id, self.source_ip, "ssh", cmd,
             params, response.status, response.response_type,
-            mitre=mitre,
+            mitre=mitre, raw_metadata=self._raw_metadata(),
         ))
 
     def _apply_cwd(self, new_cwd: str) -> None:
         if new_cwd != self.current_dir:
+            old_cwd = self.current_dir
             self.current_dir = new_cwd
             self.prompt = prompt_for(self.current_dir)
+            self.shell_state.cwd = new_cwd
+            self.shell_state.old_pwd = old_cwd
+            self.shell_state.set_env("PWD", new_cwd)
+            self.shell_state.set_env("OLDPWD", old_cwd)
 
-    def _handle_cd(self, cmd: str, mitre: dict) -> bool | None:
-        """Handle 'cd <path>': returns True when handled (success or failure)."""
-        result = resolve_cd(cmd[3:].strip(), self.current_dir, self.fs)
-        if result.ok:
-            self._apply_cwd(result.cwd)
-            return None
+    def _sync_cwd(self) -> None:
+        """Mirror a cwd change made by decide_response() into the prompt."""
+        if self.shell_state.cwd != self.current_dir:
+            self.current_dir = self.shell_state.cwd
+            self.prompt = prompt_for(self.current_dir)
 
-        self._write(("\r\n" + result.error + "\r\n" + self.prompt).encode())
-        log_event(build_event(
-            self.session_id, self.source_ip, "ssh", cmd,
-            {"command": cmd, "target": result.path}, "1", "cd_failed", mitre=mitre,
-        ))
-        return True
+    def _raw_metadata(self) -> dict:
+        metadata = {}
+        if self.client_version:
+            metadata["client_version"] = self.client_version
+        if self.term_type:
+            metadata["terminal_type"] = self.term_type
+        return metadata
 
     # ------------------------------------------------------------------
     # Exec channel (ssh host "command")
@@ -185,7 +200,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
 
         args = parse_args(cmd)
         if has_shell_syntax(cmd):
-            response, self.current_dir = decide_line(
+            response, new_cwd = decide_line(
                 "ssh",
                 self.session_id,
                 cmd,
@@ -193,6 +208,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
                 self.fs,
                 username=self.username,
             )
+            self._apply_cwd(new_cwd)
         else:
             response = decide_response(
                 "ssh",
@@ -201,7 +217,9 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
                 {"args": args, "cwd": self.current_dir},
                 self.fs,
                 username=self.username,
+                shell_state=self.shell_state,
             )
+            self._sync_cwd()
 
         if response.response_type == "session_end":
             response = None  # `exit` as an exec: no output, exit 0
@@ -217,7 +235,7 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
             self.session_id, self.source_ip, "ssh", cmd,
             params, response.status if response else "0",
             response.response_type if response else "command_output",
-            mitre=mitre,
+            mitre=mitre, raw_metadata=self._raw_metadata(),
         ))
 
         try:

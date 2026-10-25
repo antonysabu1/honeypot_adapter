@@ -46,8 +46,14 @@ def build_event(
     response_status: str,
     response_type: str,
     mitre: dict | None = None,
+    raw_metadata: dict | None = None,
 ) -> dict:
-    """Build one telemetry event carrying exactly the contract's top-level keys."""
+    """Build one telemetry event carrying exactly the contract's top-level keys.
+
+    ``raw_metadata`` is for protocol fingerprint/context data (client banner,
+    terminal type, negotiated options). MITRE tags are merged into the same
+    object under the ``mitre`` key so the top-level schema stays at 11 fields.
+    """
     event = {
         "event_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -56,7 +62,7 @@ def build_event(
         "session_id": session_id,
         "action": action,
         "parameters": parameters,
-        "raw_metadata": {},
+        "raw_metadata": dict(raw_metadata or {}),
         "session_source": "protocol_native",
         "response_status": response_status,
         "response_type": response_type,

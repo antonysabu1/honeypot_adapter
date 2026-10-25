@@ -201,7 +201,7 @@ def _cmd_cd(ctx: _Ctx) -> ResponsePlan | None:
             ctx.shell_state.set_env('PWD', new_cwd)
             ctx.shell_state.set_env('OLDPWD', old_cwd)
             return ResponsePlan('command_output', '', '0')
-        return ResponsePlan('command_output', result.path, '1')
+        return ResponsePlan('cd_failed', result.error, '1')
     return None
 
 def _cmd_exit(ctx: _Ctx) -> ResponsePlan | None:

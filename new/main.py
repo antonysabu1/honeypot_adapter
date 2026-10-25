@@ -30,14 +30,16 @@ def run_paramiko_ssh():
     """Start the Paramiko listener; a bind failure must not print a traceback."""
     try:
         import ssh_adapter.server as ssh_server
-        ssh_server.start_server()
+        ssh_server.start_server(_SSH_PORT)
     except Exception as exc:  # noqa: BLE001 - telnet must survive this thread dying
         print(f"  SSH/paramiko listener failed: {exc!r}")
 
 
 async def run_telnet_and_asyncssh():
     """Telnet always runs; the experimental SSH transport is best-effort."""
-    tasks = [asyncio.create_task(_listen("Telnet", telnet_server.start_server))]
+    tasks = [asyncio.create_task(
+        _listen("Telnet", lambda: telnet_server.start_server(port=_TELNET_PORT))
+    )]
 
     try:
         import asyncssh_adapter.server as asyncssh_server
@@ -46,7 +48,8 @@ async def run_telnet_and_asyncssh():
         print("            install with: pip install -r requirements-asyncssh.txt")
     else:
         tasks.append(asyncio.create_task(
-            _listen("SSH/asyncssh", asyncssh_server.start_server)
+            _listen("SSH/asyncssh",
+                    lambda: asyncssh_server.start_server(port=_SSH_PORT))
         ))
 
     started = await asyncio.gather(*tasks)
@@ -75,4 +78,4 @@ if __name__ == "__main__":
         print("=" * 50)
         ssh_thread = threading.Thread(target=run_paramiko_ssh, daemon=True)
         ssh_thread.start()
-        asyncio.run(telnet_server.start_server())
+        asyncio.run(telnet_server.start_server(port=_TELNET_PORT))

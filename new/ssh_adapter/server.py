@@ -16,6 +16,14 @@ HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
 _HOST_KEY = None
 
 
+def _text(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _get_host_key() -> paramiko.RSAKey:
     """Lazily load (or generate) the server host key.
 
@@ -33,11 +41,24 @@ def _get_host_key() -> paramiko.RSAKey:
 
 
 class HoneypotSSHServer(paramiko.ServerInterface):
-    def __init__(self, session_id, client_address):
+    def __init__(self, session_id, client_address, transport=None):
         self.session_id = session_id
         self.client_address = client_address
+        self.transport = transport
         self.event = threading.Event()
         self.username = None
+        self.term = None
+
+    def _client_metadata(self) -> dict:
+        """Protocol fingerprint data for the client's events."""
+        metadata = {}
+        version = _text(getattr(getattr(self, "transport", None), "remote_version", None))
+        if version:
+            metadata["client_version"] = version
+        term = _text(self.term)
+        if term:
+            metadata["terminal_type"] = term
+        return metadata
 
     def check_channel_request(self, kind, chanid):
         if kind == "session":
@@ -55,6 +76,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
                 parameters={"username": username, "password": password},
                 response_status="authenticated",
                 response_type="fake_auth_success",
+                raw_metadata=self._client_metadata(),
             )
         )
         return paramiko.AUTH_SUCCESSFUL
@@ -73,6 +95,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
                 },
                 response_status="authenticated",
                 response_type="fake_auth_success",
+                raw_metadata=self._client_metadata(),
             )
         )
         return paramiko.AUTH_SUCCESSFUL
@@ -87,6 +110,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
     def check_channel_pty_request(
         self, channel, term, width, height, pixelwidth, pixelheight, modes
     ):
+        self.term = term
         return True
 
 
@@ -97,12 +121,13 @@ class SSHHandler(socketserver.BaseRequestHandler):
         transport.add_server_key(_get_host_key())
 
         source_ip = self.client_address[0]
+        session_id = create_session_id()
 
         # ENTRY GATE: Check session limits before creating a session
         if not can_create_session("ssh", source_ip):
             log_event(
                 _build_event(
-                    session_id="",
+                    session_id=session_id,
                     source_ip=source_ip,
                     protocol="ssh",
                     action="session_limit_reached",
@@ -114,7 +139,6 @@ class SSHHandler(socketserver.BaseRequestHandler):
             transport.close()
             return
 
-        session_id = create_session_id()
         session_tracker.start_session(source_ip, "ssh", session_id)
         register_session("ssh", source_ip)
 
@@ -132,7 +156,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
 
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         try:
-            server = HoneypotSSHServer(session_id, self.client_address)
+            server = HoneypotSSHServer(session_id, self.client_address, transport)
             transport.start_server(server=server)
             chan = transport.accept(20)
             if chan is None:
@@ -145,6 +169,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
                 session_id,
                 self.client_address[0],
                 username=server.username or "root",
+                raw_metadata=server._client_metadata(),
             )
             shell.run()
         finally:
@@ -157,6 +182,11 @@ class SSHHandler(socketserver.BaseRequestHandler):
                     parameters={},
                     response_status="0",
                     response_type="session_end",
+                    raw_metadata={
+                        "client_version": _text(
+                            getattr(transport, "remote_version", None)
+                        )
+                    } if getattr(transport, "remote_version", None) else None,
                 )
             )
             unregister_session("ssh", source_ip)
@@ -164,11 +194,11 @@ class SSHHandler(socketserver.BaseRequestHandler):
             transport.close()
 
 
-def start_server():
-    server = socketserver.ThreadingTCPServer(("", 2222), SSHHandler)
+def start_server(port: int = 2222):
+    server = socketserver.ThreadingTCPServer(("", port), SSHHandler)
     server.allow_reuse_address = True
     server.daemon_threads = True
-    print("SSH honeypot listening on port 2222")
+    print(f"SSH honeypot listening on port {port}")
     server.serve_forever()
 
 

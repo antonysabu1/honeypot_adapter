@@ -12,7 +12,6 @@ from shared.shell import (
     POST_LOGIN_BANNER,
     parse_args,
     prompt_for,
-    resolve_cd,
 )
 
 
@@ -43,6 +42,9 @@ class TelnetSession:
         self.buffer = b""
         self._iac_buf = b""  # leftover bytes of a partial IAC sequence
         self._sb_mode = False  # inside an IAC SB ... IAC SE subnegotiation
+        self._sb_option = None
+        self._sb_payload = bytearray()
+        self.term_type = None
 
     def handle_data(self, data: bytes):
         """Parse telnet framing (RFC 854) and feed complete lines to the shell.
@@ -55,14 +57,27 @@ class TelnetSession:
         i = 0
         while i < len(buf):
             if self._sb_mode:
-                # Consume everything until IAC SE (or escaped IAC IAC).
-                if buf[i] == 255:
-                    if i + 1 < len(buf):
-                        if buf[i + 1] == 240:  # IAC SE terminates subnegotiation
-                            self._sb_mode = False
-                        i += 2  # also covers IAC IAC inside the payload
-                        continue
-                    break  # trailing IAC — wait for the next chunk
+                # Collect the payload until IAC SE; IAC IAC is a literal 255.
+                byte = buf[i]
+                if byte == 255:
+                    if i + 1 >= len(buf):
+                        break  # trailing IAC — wait for the next chunk
+                    nxt = buf[i + 1]
+                    if nxt == 240:  # IAC SE terminates subnegotiation
+                        self._handle_subnegotiation(
+                            self._sb_option, bytes(self._sb_payload)
+                        )
+                        self._sb_mode = False
+                        self._sb_option = None
+                        self._sb_payload = bytearray()
+                        i += 2
+                    elif nxt == 255:  # escaped IAC inside the payload
+                        self._sb_payload.append(255)
+                        i += 2
+                    else:  # IAC command inside SB — consume and ignore
+                        i += 2
+                    continue
+                self._sb_payload.append(byte)
                 i += 1
                 continue
 
@@ -72,8 +87,12 @@ class TelnetSession:
                     break  # incomplete sequence — wait for more data
                 cmd = buf[i + 1]
                 if cmd == 250:  # SB — subnegotiation begins
+                    if i + 2 >= len(buf):
+                        break  # wait for the subnegotiation option byte
                     self._sb_mode = True
-                    i += 2
+                    self._sb_option = buf[i + 2]
+                    self._sb_payload = bytearray()
+                    i += 3
                 elif cmd in (251, 252, 253, 254):  # WILL/WONT/DO/DONT + option
                     if i + 2 >= len(buf):
                         break
@@ -118,9 +137,18 @@ class TelnetSession:
                 self.transport.write(b"\xff\xfd\x01")  # DO ECHO
             elif option == 3:
                 self.transport.write(b"\xff\xfd\x03")  # DO SGA
+            elif option == 24:  # TERMINAL-TYPE — ask for the client's value
+                self.transport.write(b"\xff\xfa\x18\x01\xff\xf0")  # SB TTYPE SEND
             else:
                 self.transport.write(b"\xff\xfe" + bytes([option]))  # DONT
         # WONT/DONT need no reply.
+
+    def _handle_subnegotiation(self, option, payload: bytes) -> None:
+        """Record useful subnegotiation values (currently TERMINAL-TYPE)."""
+        if option == 24 and payload and payload[0] == 0:  # TTYPE IS <value>
+            term = payload[1:].decode("ascii", errors="ignore").strip()
+            if term:
+                self.term_type = term[:64]
 
     def process_line(self, line: str):
         if self.state == "login":
@@ -147,6 +175,7 @@ class TelnetSession:
                     "mitre_tactic": "Initial Access",
                     "mitre_confidence": "high",
                 },
+                raw_metadata=self._raw_metadata(),
             ))
             self.transport.write(POST_LOGIN_BANNER.encode())
             self.transport.write(self.prompt.encode())
@@ -177,8 +206,13 @@ class TelnetSession:
                     username=self.username or "root",
                 )
                 if new_cwd != self.current_dir:
+                    old_cwd = self.current_dir
                     self.current_dir = new_cwd
                     self.prompt = prompt_for(self.current_dir)
+                    self.shell_state.cwd = new_cwd
+                    self.shell_state.old_pwd = old_cwd
+                    self.shell_state.set_env("PWD", new_cwd)
+                    self.shell_state.set_env("OLDPWD", old_cwd)
             else:
                 response = decide_response(
                     "telnet",
@@ -196,26 +230,11 @@ class TelnetSession:
                 self.transport.close()
                 return
 
-            # cd (shared policy; telnet keeps its own sink and logging)
-            cmd = line
-            if cmd.strip() == "cd":
-                cmd = "cd /root"
-            if not chained and cmd.startswith("cd "):
-                cd = resolve_cd(cmd[3:].strip(), self.current_dir, self.fs)
-                if not cd.ok:
-                    self.transport.write(
-                        ("\r\n" + cd.error + "\r\n" + self.prompt).encode()
-                    )
-                    self._log(
-                        line, "1", "cd_failed", mitre,
-                        {"command": line, "target": cd.path},
-                    )
-                    return
-                self.current_dir = cd.cwd
+            # `cd` mutates the session's shell state inside the one decision
+            # seam; the transport only mirrors the resulting cwd into its prompt.
+            if not chained and self.shell_state.cwd != self.current_dir:
+                self.current_dir = self.shell_state.cwd
                 self.prompt = prompt_for(self.current_dir)
-                self.transport.write(("\r\n" + self.prompt).encode())
-                self._log(line, "0", "command_output", mitre)
-                return
 
             content = response.content.replace("\n", "\r\n")
             self.transport.write(("\r\n" + content + "\r\n" + self.prompt).encode())
@@ -225,6 +244,12 @@ class TelnetSession:
             if response.redirect:
                 params["redirect"] = response.redirect
             self._log(line, response.status, response.response_type, mitre, params)
+
+    def _raw_metadata(self) -> dict:
+        metadata = {}
+        if self.term_type:
+            metadata["terminal_type"] = self.term_type
+        return metadata
 
     def _log(self, action: str, response_status: str, response_type: str,
              mitre: dict, parameters: dict | None = None) -> None:
@@ -238,4 +263,5 @@ class TelnetSession:
             response_status=response_status,
             response_type=response_type,
             mitre=mitre,
+            raw_metadata=self._raw_metadata(),
         ))

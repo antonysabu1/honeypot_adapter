@@ -13,7 +13,6 @@ from shared.shell import (
     POST_LOGIN_BANNER,
     parse_args,
     prompt_for,
-    resolve_cd,
 )
 
 
@@ -25,11 +24,13 @@ class FakeSSHShell:
     the telemetry it emits.
     """
 
-    def __init__(self, channel, session_id, source_ip, username="root"):
+    def __init__(self, channel, session_id, source_ip, username="root",
+                 raw_metadata=None):
         self.channel = channel
         self.session_id = session_id
         self.source_ip = source_ip
         self.username = username or "root"
+        self.raw_metadata = dict(raw_metadata or {})
         # SAFETY: No real file access — uses FakeFilesystem
         self.fs = FakeFilesystem()
         self.current_dir = "/root"
@@ -69,6 +70,7 @@ class FakeSSHShell:
             response_status=response_status,
             response_type=response_type,
             mitre=mitre,
+            raw_metadata=self.raw_metadata,
         ))
 
     # ------------------------------------------------------------------
@@ -88,10 +90,6 @@ class FakeSSHShell:
             self._editor.feed(data)
 
     def handle_command(self, cmd: str):
-        # FIX: Rewrite bare "cd" BEFORE decide_response
-        if cmd.strip() == "cd":
-            cmd = "cd /root"
-
         mitre = mitre_analyze(cmd)
 
         # SAFETY: No subprocess/os.system — all responses via decide_response()
@@ -123,16 +121,15 @@ class FakeSSHShell:
                 username=self.username,
                 shell_state=self.shell_state,
             )
+            # `cd` mutates the session's shell state inside the one decision
+            # seam; the transport only mirrors the resulting cwd into its prompt.
+            self._sync_cwd()
 
         if response.response_type == "session_end":
             self.channel.send(b"\r\nlogout\r\n")
             self._log(cmd, "0", "session_end", mitre)
             self._closed = True
             return
-
-        if not chained and cmd.startswith("cd "):
-            if not self._handle_cd(cmd, mitre):
-                return
 
         # Normalize \n to \r\n for PTY display
         content = response.content.replace("\n", "\r\n")
@@ -154,17 +151,8 @@ class FakeSSHShell:
             self.shell_state.set_env('PWD', new_cwd)
             self.shell_state.set_env('OLDPWD', old_cwd)
 
-    def _handle_cd(self, cmd: str, mitre: dict) -> bool:
-        """Perform `cd`; returns False when the move failed (already reported)."""
-        result = resolve_cd(cmd[3:].strip(), self.current_dir, self.fs)
-        if result.ok:
-            self._apply_cwd(result.cwd)
-            return True
-
-        self.channel.send(("\r\n" + result.error + "\r\n" + self.prompt).encode())
-        # Log the failed attempt with its target, as before.
-        self._log(
-            cmd, "1", "cd_failed", mitre,
-            {"command": cmd, "target": result.path},
-        )
-        return False
+    def _sync_cwd(self) -> None:
+        """Mirror a cwd change made by decide_response() into the prompt."""
+        if self.shell_state.cwd != self.current_dir:
+            self.current_dir = self.shell_state.cwd
+            self.prompt = prompt_for(self.current_dir)
