@@ -39,11 +39,12 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
     """
 
     def __init__(self, session_id: str, source_ip: str, username: str = "root",
-                 client_version: str | None = None):
+                 client_version: str | None = None, on_close=None):
         self.session_id = session_id
         self.source_ip = source_ip
         self.username = username or "root"
         self.client_version = client_version
+        self._on_close = on_close  # called once when this session channel ends
         self.term_type = None
         # A channel opened later in the same session starts where it left off.
         self.current_dir = session_cwd(session_id, self.username)
@@ -92,6 +93,9 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
 
     def connection_lost(self, exc) -> None:
         self._closed = True
+        if self._on_close is not None:
+            self._on_close()
+            self._on_close = None
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
