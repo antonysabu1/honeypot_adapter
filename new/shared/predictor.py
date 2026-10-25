@@ -98,6 +98,58 @@ def detect_anomaly(session_id: str, db_path: str | None = None) -> tuple[bool, f
         return (False, 0.0)
 
 
+def predict_next_categories(session_id: str, top_k: int = 3, db_path: str | None = None) -> list[str]:
+    """Predict the most likely next action categories for *session_id*.
+
+    Loads the Markov transition table, determines the session's most
+    recent action category, and returns the top-k most probable next
+    categories.  Returns an empty list when the table is missing.
+    """
+    table_path = MODELS_DIR / "action_transition_table.json"
+    if not table_path.exists():
+        return []
+
+    try:
+        import json as _json
+        data = _json.loads(table_path.read_text(encoding="utf-8"))
+        transition_table = data["transition_table"]
+        categories = data["categories"]
+    except Exception as exc:
+        logger.warning("Failed to load transition table: %s", exc)
+        return []
+
+    try:
+        from shared.storage import get_storage, StorageEngine
+        from pathlib import Path as _Path
+
+        store = StorageEngine(db_path) if db_path else get_storage()
+        row = store.fetch_one(
+            "SELECT action, parameters FROM events WHERE session_id=? ORDER BY timestamp DESC LIMIT 1",
+            (session_id,),
+        )
+        if db_path:
+            store._close()
+
+        if row is None:
+            return categories[:top_k]
+
+        try:
+            import json as _j
+            params = _j.loads(row["parameters"]) if row["parameters"] else {}
+        except Exception:
+            params = {}
+
+        current_cat = classify_action_category(row["action"], params)
+        probs = transition_table.get(current_cat, {})
+        if not probs:
+            return categories[:top_k]
+
+        return sorted(probs, key=probs.__getitem__, reverse=True)[:top_k]
+    except Exception as exc:
+        logger.warning("Markov prediction failed: %s", exc)
+        return categories[:top_k] if categories else []
+
+
 def classify_action_category(action: str, params: dict | None = None) -> str:
     """Map a command action string to one of the Markov action categories."""
     name = (params or {}).get("name", action.split()[0] if action else "")

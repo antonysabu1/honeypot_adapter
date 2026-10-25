@@ -1,0 +1,42 @@
+{
+  "transition_table": {
+    "recon": {
+      "recon": 0.1,
+      "discovery": 0.6,
+      "credential_access": 0.1,
+      "exfiltration": 0.1,
+      "other": 0.1
+    },
+    "discovery": {
+      "discovery": 0.2727272727272727,
+      "credential_access": 0.45454545454545453,
+      "persistence": 0.18181818181818182,
+      "exfiltration": 0.09090909090909091
+    },
+    "credential_access": {
+      "exfiltration": 0.75,
+      "persistence": 0.25
+    },
+    "persistence": {
+      "persistence": 0.3333333333333333,
+      "exfiltration": 0.3333333333333333,
+      "destruction": 0.3333333333333333
+    },
+    "exfiltration": {
+      "exfiltration": 1.0
+    },
+    "other": {
+      "recon": 0.5,
+      "discovery": 0.5
+    }
+  },
+  "categories": [
+    "credential_access",
+    "discovery",
+    "exfiltration",
+    "other",
+    "persistence",
+    "recon"
+  ],
+  "sessions_used": 50
+}
