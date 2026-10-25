@@ -171,6 +171,7 @@ def main() -> None:
                 out = stdout.read() + stderr.read()
                 rc = stdout.channel.recv_exit_status()
                 assert expected_out in out, f"exec {cmd!r} output: {out!r}"
+                assert out.endswith(b"\n"), f"exec {cmd!r} output lacks a newline: {out!r}"
                 assert rc == expected_rc, f"exec {cmd!r} exit status {rc}"
             finally:
                 exec_client.close()
