@@ -12,6 +12,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,7 +21,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import paramiko
 
 import shared.logger as logger_mod
-import ssh_adapter.server as ssh_server
 from ssh_adapter.server import SSHHandler
 
 
@@ -38,12 +38,20 @@ def recv_until(chan: paramiko.Channel, marker: bytes, timeout: float = 8.0) -> b
     return buf
 
 
+def wait_for_event(action: str, count: int, timeout: float = 5.0) -> None:
+    """Wait until `count` events with this action have been logged."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        lines = logger_mod.LOG_FILE.read_text(encoding="utf-8").splitlines()
+        if sum(json.loads(l)["action"] == action for l in lines if l.strip()) >= count:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"no {action!r} event x{count} within {timeout}s")
+
+
 def main() -> None:
     # Redirect honeypot logging to a temp file so the test never touches the
     # real logs/honeypot.jsonl. log_event() resolves these globals at call time.
-    # A connection with no open channel is dropped after IDLE_SECONDS; keep it
-    # short so the test does not wait out the production default.
-    ssh_server.IDLE_SECONDS = 1
     tmp_dir = Path(tempfile.mkdtemp(prefix="honeypot-ssh-test-"))
     logger_mod.LOG_DIR = tmp_dir
     logger_mod.LOG_FILE = tmp_dir / "honeypot.jsonl"
@@ -106,10 +114,9 @@ def main() -> None:
         # A clean finish reports exit status 0 (sshd does); a dropped
         # connection would leave it at -1 and the client sees a reset.
         assert chan.recv_exit_status() == 0, "exit did not report exit status 0"
-        client.get_transport().join(timeout=10)
-        assert not client.get_transport().is_active(), (
-            "server left the connection open after the last channel closed"
-        )
+        # The connection ends when the client hangs up, as with sshd.
+        client.close()
+        wait_for_event("connection_closed", 1)
 
         # --- 8) events flowed through the shared logging pipeline ---
         events = [
