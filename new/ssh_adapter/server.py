@@ -6,6 +6,7 @@ from pathlib import Path
 # paramiko is a required third-party dependency. It is installed (v5.0.0).
 import paramiko
 
+from shared.config import get
 from shared.events import build_event as _build_event
 from shared.logger import log_event
 from shared.session import create_session_id, tracker as session_tracker
@@ -16,8 +17,10 @@ HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
 
 # Sessions one connection may have open at once: sshd's MaxSessions (default 10).
 MAX_CHANNELS = 10
-# A connection with no open channel is dropped after this many seconds.
-IDLE_SECONDS = 30
+
+def _max_lifetime() -> float:
+    """Honeypot safeguard: sshd has no cap, but a connection must not live forever."""
+    return float(get("limits.session_timeout", 3600))
 
 _HOST_KEY = None
 
@@ -213,13 +216,13 @@ class SSHHandler(socketserver.BaseRequestHandler):
         try:
             server = HoneypotSSHServer(session_id, self.client_address, transport)
             transport.start_server(server=server)
-            chan = transport.accept(20)
-            if chan is None:
-                return
-
+            # Like sshd, the connection stays up until the client hangs up,
+            # whether or not it has a session open right now; it may open
+            # and close sessions (channels) at will.
             workers = []
-            idle_since = time.monotonic()
-            while chan is not None or transport.is_active():
+            deadline = time.monotonic() + _max_lifetime()
+            while transport.is_active() and time.monotonic() < deadline:
+                chan = transport.accept(1)
                 if chan is not None:
                     worker = threading.Thread(
                         target=self._serve_channel,
@@ -230,12 +233,7 @@ class SSHHandler(socketserver.BaseRequestHandler):
                         server.open_channels += 1
                     worker.start()
                     workers.append(worker)
-                chan = transport.accept(1)
                 workers = [w for w in workers if w.is_alive()]
-                if workers or chan is not None:
-                    idle_since = time.monotonic()
-                elif time.monotonic() - idle_since > IDLE_SECONDS:
-                    break
             for worker in workers:
                 worker.join(timeout=5)
         finally:
