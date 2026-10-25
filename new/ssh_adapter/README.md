@@ -27,5 +27,10 @@ python3 test_integration_ssh.py
 
 The adapter accepts any password/public key (fake authentication) and runs a
 fake shell over the VirtualOS filesystem. Every command is answered by
-`shared.response_engine.decide_response()` / `decide_line()` and logged through
+`shared.response_engine.decide_response()` and logged through
 `shared.logger.log_event()` with the shared eleven-field event schema.
+
+Interactive shells and `ssh host "cmd"` exec requests are both served. One
+connection is one session: it may open up to 10 channels (for example with
+OpenSSH connection sharing), all sharing the session's directory and
+environment, and it is dropped 30 seconds after its last channel closes.
