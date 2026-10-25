@@ -112,10 +112,24 @@ def log_event(event_dict: dict) -> None:
     except Exception:
         pass
 
+    # Update attack-progression graph for this session. Best-effort.
+    try:
+        _update_attack_graph(event_dict)
+    except Exception:
+        pass
+
     print(
         f"[{str(event_dict['protocol']).upper()}] "
         f"{event_dict['source_ip']} \u2192 action: {event_dict['action']}"
     )
+
+
+def _update_attack_graph(event_dict: dict) -> None:
+    from shared.attack_graph import evaluate_event
+    session_id = event_dict.get("session_id", "")
+    action = event_dict.get("action", "")
+    params = event_dict.get("parameters") or {}
+    evaluate_event(session_id, action, params)
 
 
 def _write_to_storage(event_dict: dict) -> None:

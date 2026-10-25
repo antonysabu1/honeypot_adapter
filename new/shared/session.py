@@ -43,6 +43,12 @@ class SessionTracker:
             get_storage().close_session(session_id, duration_ms)
         except Exception:
             pass
+        # Release attack-graph in-memory state for this session.
+        try:
+            from shared.attack_graph import drop_session as _drop_graph
+            _drop_graph(session_id)
+        except Exception:
+            pass
         # The core owns per-session VirtualOS state; release it with the session.
         drop_state(session_id)
         forget_session_commands(session_id)
