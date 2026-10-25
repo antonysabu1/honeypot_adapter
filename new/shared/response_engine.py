@@ -1327,17 +1327,6 @@ def _cmd_groups(ctx: _Ctx) -> ResponsePlan | None:
     return None
 
 
-_ENV: dict[str, str] = {
-    "HOME": "/root",
-    "USER": "root",
-    "SHELL": "/bin/bash",
-    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    "LANG": "en_US.UTF-8",
-    "TERM": "xterm-256color",
-    "PWD": "/",
-}
-
-
 def _cmd_env(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'env':
         lines = [f"{k}={v}" for k, v in sorted(ctx.shell_state.env.items())]
@@ -1360,18 +1349,19 @@ def _cmd_printenv(ctx: _Ctx) -> ResponsePlan | None:
 
 def _cmd_export(ctx: _Ctx) -> ResponsePlan | None:
     if ctx.base == 'export':
+        env = ctx.shell_state.env
         if not ctx.args:
             # No arguments: print all exported variables
-            lines = [f"export {k}={v}" for k, v in sorted(_ENV.items())]
+            lines = [f"export {k}={v}" for k, v in sorted(env.items())]
             return ResponsePlan('command_output', '\n'.join(lines) + '\n', '0')
-        # Set a variable as exported (same as assignment in bash)
-        key = ctx.args[0]
-        if '=' in key:
-            key, value = key.split('=', 1)
-            ctx.shell_state.set_env(key, value)
-        else:
-            # Variable name only - mark it as exported (no value change)
-            ctx.shell_state.set_env(key, _ENV.get(key, ''))
+        # `export A=1 B=2`: every argument is a name, optionally with a value.
+        # A bare name is marked exported and keeps its current value.
+        for arg in ctx.args:
+            if '=' in arg:
+                key, value = arg.split('=', 1)
+                env[key] = value
+            else:
+                env.setdefault(arg, '')
         return ResponsePlan('command_output', '', '0')
     return None
 
