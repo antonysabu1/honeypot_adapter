@@ -201,6 +201,9 @@ class SSHHandler(socketserver.BaseRequestHandler):
             )
             unregister_session("ssh", source_ip)
             session_tracker.end_session(session_id)
+            # Let the client read the channel close and hang up first, so the
+            # session ends with a clean disconnect, not a reset connection.
+            transport.join(timeout=2)
             transport.close()
 
 
