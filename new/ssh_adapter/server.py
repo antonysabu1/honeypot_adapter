@@ -14,7 +14,7 @@ from ssh_adapter.shell import FakeSSHShell
 
 HOST_KEY_PATH = Path(__file__).resolve().parent / "host_key"
 
-# Channels one connection may have open at once (OpenSSH's default is 10).
+# Sessions one connection may have open at once: sshd's MaxSessions (default 10).
 MAX_CHANNELS = 10
 # A connection with no open channel is dropped after this many seconds.
 IDLE_SECONDS = 30
@@ -85,7 +85,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         if kind != "session":
             return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
         if self.open_channels >= MAX_CHANNELS:
-            return paramiko.OPEN_FAILED_RESOURCE_SHORTAGE
+            return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
         return paramiko.OPEN_SUCCEEDED
 
     def check_auth_password(self, username, password):
