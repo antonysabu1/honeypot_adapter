@@ -116,6 +116,8 @@ async def run_asyncssh_tests():
         result = await conn2.run("whoami")
         assert "alice" in result.stdout, f"exec whoami: {result.stdout!r}"
 
+        assert result.stdout.endswith("\n"), f"exec output lacks a newline: {result.stdout!r}"
+
         result2 = await conn2.run("uname -a")
         assert "Linux honeypot 5.15.0" in result2.stdout, f"exec uname: {result2.stdout!r}"
 
