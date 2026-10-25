@@ -172,6 +172,48 @@ def main() -> None:
         finally:
             sock2.close()
 
+        # --- 11) RFC 854 CR NUL line endings, split across TCP segments, must
+        # not swallow the password or run it as a shell command ---
+        sock3 = connect_with_retry(port)
+        try:
+            recv_until(sock3, b"login: ")
+            sock3.sendall(b"carol\r")
+            time.sleep(0.2)  # force the NUL into a separate segment
+            sock3.sendall(b"\x00")
+            recv_until(sock3, b"Password: ")
+            sock3.sendall(b"hunter2\r\x00")
+            recv_until(sock3, b"root@honeypot:~# ")
+            sock3.sendall(b"whoami\r\x00")
+            out = recv_until(sock3, b"root@honeypot:~# ")
+            assert b"carol" in out, f"whoami after CR NUL login: {out!r}"
+            sock3.sendall(b"id\n")  # a bare LF (netcat-style) ends a line too
+            out = recv_until(sock3, b"root@honeypot:~# ")
+            assert b"uid=" in out, f"bare LF line not answered: {out!r}"
+        finally:
+            sock3.close()
+
+        deadline = time.monotonic() + 5
+        while True:
+            events = [
+                json.loads(line)
+                for line in logger_mod.LOG_FILE.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            carol = [e for e in events if e["action"] == "login_attempt"
+                     and e["parameters"].get("username") == "carol"]
+            if carol or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        assert len(carol) == 1, f"CR NUL login not logged once: {carol}"
+        assert carol[0]["parameters"]["password"] == "hunter2", (
+            f"password garbled by CR NUL: {carol[0]['parameters']}"
+        )
+        session = [e for e in events if e["session_id"] == carol[0]["session_id"]]
+        assert "hunter2" not in [e["action"] for e in session], (
+            "password was run as a shell command"
+        )
+        assert [e["action"] for e in session].count("whoami") == 1
+
         print("ALL TELNET INTEGRATION TESTS PASSED")
     finally:
         if sock is not None:

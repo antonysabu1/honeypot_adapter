@@ -49,6 +49,7 @@ class TelnetSession:
         # does), so the client stops echoing locally and we echo instead —
         # which is what lets the password be typed without being shown.
         self._will_echo = True
+        self._after_cr = False  # last data byte was CR (pairs with LF/NUL)
 
     def handle_data(self, data: bytes):
         """Parse telnet framing (RFC 854) and feed complete lines to the shell.
@@ -105,23 +106,23 @@ class TelnetSession:
                 else:  # NOP, GA, IP, AO, ... — consume and ignore
                     i += 2
                 continue
-            if byte == 13:  # \r — process the line (a lone CR must work too)
-                line = self.buffer.decode("utf-8", errors="ignore").strip()
-                self.buffer = b""
-                if line:
-                    self.process_line(line)
-                elif self.state == "shell":
-                    self.transport.write(("\r\n" + self.prompt).encode())
-                # Skip a trailing \n if present (CRLF line ending)
-                if i + 1 < len(buf) and buf[i + 1] == 10:
-                    i += 1
+            if byte == 13:  # CR ends the line (RFC 854: CR LF or CR NUL)
+                self._end_line()
+                self._after_cr = True
                 i += 1
                 continue
-            if byte == 10 or byte == 0:  # \n or NUL ends the line
-                line = self.buffer.decode("utf-8", errors="ignore").strip()
-                self.buffer = b""
-                self.process_line(line)
-            elif byte in (8, 127):  # BS / DEL — erase one character
+            if byte in (10, 0):
+                if self._after_cr:
+                    # Second half of CR LF / CR NUL, possibly in a later
+                    # segment: the line already ended at the CR.
+                    self._after_cr = False
+                elif byte == 10:  # a bare LF (e.g. netcat) also ends a line
+                    self._end_line()
+                # A bare NUL is a no-op.
+                i += 1
+                continue
+            self._after_cr = False
+            if byte in (8, 127):  # BS / DEL — erase one character
                 if self.buffer:
                     # Drop a whole UTF-8 character, not just its last byte.
                     end = len(self.buffer) - 1
@@ -138,6 +139,16 @@ class TelnetSession:
                 self._echo(bytes([byte]))
             i += 1
         self._iac_buf = buf[i:]
+
+    def _end_line(self) -> None:
+        line = self.buffer.decode("utf-8", errors="ignore").strip()
+        self.buffer = b""
+        if line or self.state == "password":  # an empty password is valid
+            self.process_line(line)
+        elif self.state == "login":
+            self.transport.write(b"\r\nlogin: ")
+        elif self.state == "shell":
+            self.transport.write(("\r\n" + self.prompt).encode())
 
     def _echo(self, data: bytes) -> None:
         """Echo typed input, except while the password is being entered."""
