@@ -132,6 +132,36 @@ def main() -> None:
                        "hacked", "exit", "connection_closed"):
             assert counts[action] == 1, f"{action} logged {counts[action]}x: {counts}"
 
+        # --- 9) exec channel (`ssh host "cmd"`) is answered and logged ---
+        # One exec per connection, like `ssh host "cmd"` from a real client.
+        for cmd, expected_out, expected_rc in (
+            ("uname -a", b"Linux honeypot", 0),
+            ("cat /nonexistent", b"No such file or directory", 1),
+        ):
+            exec_client = paramiko.SSHClient()
+            exec_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                exec_client.connect(
+                    "127.0.0.1", port=port, username="bot", password="bot",
+                    look_for_keys=False, allow_agent=False, timeout=10,
+                )
+                _, stdout, stderr = exec_client.exec_command(cmd, timeout=10)
+                out = stdout.read() + stderr.read()
+                rc = stdout.channel.recv_exit_status()
+                assert expected_out in out, f"exec {cmd!r} output: {out!r}"
+                assert rc == expected_rc, f"exec {cmd!r} exit status {rc}"
+            finally:
+                exec_client.close()
+
+        events = [
+            json.loads(line)
+            for line in logger_mod.LOG_FILE.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        exec_events = [e for e in events if e["action"] in ("uname -a", "cat /nonexistent")]
+        assert len(exec_events) == 2, f"exec commands not logged once each: {exec_events}"
+        assert all(set(e) == contract for e in exec_events), "exec event breaks contract"
+
         print("ALL SSH INTEGRATION TESTS PASSED")
     finally:
         client.close()

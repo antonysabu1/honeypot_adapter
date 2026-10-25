@@ -48,6 +48,7 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         self.event = threading.Event()
         self.username = None
         self.term = None
+        self.exec_command = None
 
     def _client_metadata(self) -> dict:
         """Protocol fingerprint data for the client's events."""
@@ -104,6 +105,12 @@ class HoneypotSSHServer(paramiko.ServerInterface):
         return "password,publickey"
 
     def check_channel_shell_request(self, channel):
+        self.event.set()
+        return True
+
+    def check_channel_exec_request(self, channel, command):
+        # `ssh host "cmd"`: accepted like sshd would, answered by the fake shell.
+        self.exec_command = _text(command)
         self.event.set()
         return True
 
@@ -171,7 +178,10 @@ class SSHHandler(socketserver.BaseRequestHandler):
                 username=server.username or "root",
                 raw_metadata=server._client_metadata(),
             )
-            shell.run()
+            if server.exec_command is not None:
+                shell.run_exec(server.exec_command)
+            else:
+                shell.run()
         finally:
             log_event(
                 _build_event(

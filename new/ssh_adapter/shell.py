@@ -91,7 +91,26 @@ class FakeSSHShell:
 
     def handle_command(self, cmd: str):
         mitre = mitre_analyze(cmd)
+        response = self._decide(cmd)
 
+        if response.response_type == "session_end":
+            self.channel.send(b"\r\nlogout\r\n")
+            self._log(cmd, "0", "session_end", mitre)
+            self._closed = True
+            return
+
+        # Normalize \n to \r\n for PTY display
+        content = response.content.replace("\n", "\r\n")
+        self.channel.send(("\r\n" + content + "\r\n" + self.prompt).encode())
+
+        # A redirected write target is intel: record it, never print it.
+        params = {"command": cmd}
+        if response.redirect:
+            params["redirect"] = response.redirect
+        self._log(cmd, response.status, response.response_type, mitre, params)
+
+    def _decide(self, cmd: str):
+        """Answer one command line through the shared engine."""
         # SAFETY: No subprocess/os.system — all responses via decide_response()
         # args are passed through untouched so flags and non-path operands
         # (e.g. `which bash`, `date +%Y`, `find -name ...`) are not corrupted;
@@ -124,22 +143,35 @@ class FakeSSHShell:
             # `cd` mutates the session's shell state inside the one decision
             # seam; the transport only mirrors the resulting cwd into its prompt.
             self._sync_cwd()
+        return response
 
+    def run_exec(self, command: str) -> int:
+        """Answer an exec request (`ssh host "cmd"`): no prompt, no PTY.
+
+        The command is answered and logged exactly like an interactive one;
+        the channel then reports the exit status and closes, as sshd does.
+        """
+        cmd = command.strip()
+        mitre = mitre_analyze(cmd)
+        response = self._decide(cmd)
         if response.response_type == "session_end":
-            self.channel.send(b"\r\nlogout\r\n")
             self._log(cmd, "0", "session_end", mitre)
-            self._closed = True
-            return
-
-        # Normalize \n to \r\n for PTY display
-        content = response.content.replace("\n", "\r\n")
-        self.channel.send(("\r\n" + content + "\r\n" + self.prompt).encode())
-
-        # A redirected write target is intel: record it, never print it.
-        params = {"command": cmd}
-        if response.redirect:
-            params["redirect"] = response.redirect
-        self._log(cmd, response.status, response.response_type, mitre, params)
+            exit_code = 0
+        else:
+            if response.content:
+                self.channel.sendall(response.content.encode())
+            params = {"command": cmd}
+            if response.redirect:
+                params["redirect"] = response.redirect
+            self._log(cmd, response.status, response.response_type, mitre, params)
+            try:
+                exit_code = int(response.status)
+            except (TypeError, ValueError):
+                exit_code = 0
+        self.channel.send_exit_status(exit_code)
+        self._closed = True
+        self.channel.close()
+        return exit_code
 
     def _apply_cwd(self, new_cwd: str) -> None:
         if new_cwd != self.current_dir:
