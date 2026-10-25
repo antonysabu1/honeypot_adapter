@@ -21,6 +21,7 @@ from shared.events import build_event, command_parameters
 from shared.logger import log_event
 from shared.mitre import mitre_analyze
 from shared.response_engine import decide_response
+from shared.session_state import session_cwd
 from shared.shell import (
     LineEditor,
     POST_LOGIN_BANNER,
@@ -44,7 +45,8 @@ class AsyncSSHShell(asyncssh.SSHServerSession):
         self.username = username or "root"
         self.client_version = client_version
         self.term_type = None
-        self.current_dir = "/root"
+        # A channel opened later in the same session starts where it left off.
+        self.current_dir = session_cwd(session_id, self.username)
         self.prompt = prompt_for(self.current_dir)
         self._chan = None
         self._exec_command = None
