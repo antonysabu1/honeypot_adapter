@@ -1,6 +1,8 @@
 import asyncio
 import os
+import sys
 import threading
+from pathlib import Path
 
 from shared.config import get
 
@@ -12,6 +14,21 @@ VALID_SSH_ADAPTERS = ("paramiko", "asyncssh")
 
 _SSH_PORT = get("ssh.port", 2222)
 _TELNET_PORT = get("telnet.port", 2323)
+_HTTP_PORT = get("http.port", 8080)
+
+_HTTP_APP_DIR = Path(__file__).resolve().parent.parent / "Dynamic-HTTP-Honeypot" / "mock-cms"
+
+
+def run_http():
+    """Start the HTTP honeypot (mock-CMS) using waitress in a daemon thread."""
+    try:
+        if str(_HTTP_APP_DIR) not in sys.path:
+            sys.path.insert(0, str(_HTTP_APP_DIR))
+        from waitress import serve
+        import app as http_app
+        serve(http_app.app, host="0.0.0.0", port=_HTTP_PORT, ident="Apache/2.4.29 (Ubuntu)")
+    except Exception as exc:  # noqa: BLE001 - HTTP failure must not kill SSH/Telnet
+        print(f"  HTTP listener failed: {exc!r}")
 
 
 async def _listen(name: str, start) -> bool:
@@ -69,6 +86,13 @@ if __name__ == "__main__":
             f"  HONEYPOT_SSH_ADAPTER={SSH_ADAPTER!r} is not one of "
             f"{VALID_SSH_ADAPTERS} - using the default (paramiko)"
         )
+
+    if _HTTP_APP_DIR.exists():
+        print(f"  HTTP   -> port {_HTTP_PORT} (mock-CMS honeypot)")
+        http_thread = threading.Thread(target=run_http, daemon=True, name="http-honeypot")
+        http_thread.start()
+    else:
+        print(f"  HTTP   -> disabled (mock-CMS not found at {_HTTP_APP_DIR})")
 
     if SSH_ADAPTER == "asyncssh":
         print("=" * 50)
